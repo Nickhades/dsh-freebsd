@@ -158,6 +158,13 @@ addon、jail 助手编译、`--version`，并用临时 `DSH_HOME` 在 loopback �
 （要求打印 token 且返回 HTTP 200）。`--tests` 追加定向单测（`util/ripgrep`、
 `util/native-command`、sandbox local）。
 
+`sh scripts/bundle.sh .work/tree-final` 再把构建树打成自包含运行时 tarball
+（`pnpm deploy` 闭包、Web UI、flock addon、jail 助手源码），并在临时端口上真机
+启动。0.2.2-rc.5 这一轮产出 155,642,193 字节，冒烟通过（带 token 返回 200，
+无 token 返回 401），没有指向构建机的绝对符号链接；解压到任意位置后
+`lib/bin.js --version` 可用。tarball 旁的 `distinfo.fragment` 与
+`pkg-plist.fragment` 供 FreeBSD port 使用。
+
 本修订记录的构建在 **FreeBSD 15.1-RELEASE-p7 amd64**（16 核 / 16 GB）、
 Node 22.23.5、pnpm 11.28.5 上完成：6 个补丁应用到干净的 `dsh-v0.2.2-rc.5` 树，
 `pnpm install` 复用 1428 个 store 包并用 FreeBSD 头文件编译 `node-pty`，

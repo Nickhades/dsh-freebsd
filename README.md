@@ -172,6 +172,14 @@ the FreeBSD flock addon, the jail helper compile, `--version`, and a loopback we
 boot against a scratch `DSH_HOME` (token + HTTP 200). `--tests` adds the focused
 unit tests (`util/ripgrep`, `util/native-command`, sandbox local).
 
+`sh scripts/bundle.sh .work/tree-final` then packages that tree as a
+self-contained runtime tarball (the `pnpm deploy` closure, web UI, flock addon,
+jail helper source) and boots it on a scratch port. The 0.2.2-rc.5 run produced
+155,642,193 bytes with a passing smoke (HTTP 200 with the token, 401 without)
+and no absolute build-host symlinks; `lib/bin.js --version` works after
+extraction anywhere. `distinfo.fragment` and `pkg-plist.fragment` next to the
+tarball feed the FreeBSD port.
+
 The build recorded in this revision was run on **FreeBSD 15.1-RELEASE-p7 amd64**
 (16 cores / 16 GB, Node 22.23.5, pnpm 11.28.5): six patches applied to a pristine
 `dsh-v0.2.2-rc.5` tree, `pnpm install` reused 1428 store packages and compiled
