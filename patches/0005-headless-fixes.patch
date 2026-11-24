@@ -1,0 +1,374 @@
+diff --git a/packages/api/settings-controller/src/index.ts b/packages/api/settings-controller/src/index.ts
+index 34aebd87a5..d44dc7cb0c 100644
+--- a/packages/api/settings-controller/src/index.ts
++++ b/packages/api/settings-controller/src/index.ts
+@@ -8,7 +8,9 @@
+  */
+ 
+ import { Context } from '@deepseek-ai/cordis'
++import Schema from '@deepseek-ai/schemastery'
+ import {
++  canOpenNativePath,
+   openNativeTextFile,
+ } from '@deepseek-ai/dsh-native-command'
+ import type { SettingsDescriptor, SettingsPathOp, SettingsForms } from '@deepseek-ai/dsh-settings'
+@@ -26,6 +28,12 @@ export type * from './types.ts'
+ 
+ const settingsNamespaceRequestSchema = z.object({ ns: z.string().min(1) })
+ 
++/** Native document-opening policy. */
++export interface Config {
++  /** Override platform desktop-opener detection. */
++  readonly nativeOpen?: boolean
++}
++
+ /** Read abort state afresh after an awaited provider or opener call. */
+ function isAborted(signal: AbortSignal): boolean {
+   return signal.aborted
+@@ -33,8 +41,9 @@ function isAborted(signal: AbortSignal): boolean {
+ 
+ /** Host integrations replaceable by direct unit tests. */
+ export interface SettingsControllerInternals {
+-  /** Host text-editor integration used to open the settings document. */
++  readonly openPath?: (path: string, signal: AbortSignal) => Promise<void>
+   readonly openTextFile?: (path: string, signal: AbortSignal) => Promise<void>
++  readonly canOpenPath?: () => boolean
+ }
+ 
+ /**
+@@ -74,7 +83,10 @@ declare module '@deepseek-ai/cordis' {
+  * `settings/conflict` or `settings/rejected` with the service's message.
+  */
+ export class SettingsController extends TypertRemoteService {
++  static Config: Schema<Config> = Schema.object({ nativeOpen: Schema.boolean() })
++
+   private readonly openTextFile: (path: string, signal: AbortSignal) => Promise<void>
++  private readonly canOpenPath: () => boolean
+ 
+   /**
+    * Register the settings namespace and mount the credentials namespace beside
+@@ -82,9 +94,11 @@ export class SettingsController extends TypertRemoteService {
+    * return the configuration API's actionable missing-provider diagnostic.
+    * @param ctx - Host context where settings and credential providers may be mounted.
+    */
+-  constructor(ctx: Context, internals: SettingsControllerInternals = {}) {
++  constructor(ctx: Context, options: Config & SettingsControllerInternals = {}) {
+     super(ctx, 'settingsController', { namespace: 'settings' })
+-    this.openTextFile = internals.openTextFile ?? openNativeTextFile
++    this.openTextFile = options.openTextFile ?? openNativeTextFile
++    this.canOpenPath = options.canOpenPath
++      ?? (() => options.nativeOpen ?? (options.openPath !== undefined || canOpenNativePath()))
+     ctx.plugin(CredentialsController)
+   }
+ 
+@@ -167,13 +181,19 @@ export class SettingsController extends TypertRemoteService {
+   async openSettingsDocument(signal: AbortSignal): Promise<SettingsDocumentOpenValue> {
+     const settings = this.provider()
+     if (isAborted(signal)) throw new RemoteError('gateway/cancelled', 'settings document open was aborted', {})
+-    let path: string
++    let path: string | undefined
+     try {
+       path = await settings.prepareDocument()
+     } catch (error: unknown) {
+       if (isAborted(signal)) throw new RemoteError('gateway/cancelled', 'settings document preparation was aborted', {})
+       throw new RemoteError('gateway/internal', `settings document preparation failed: ${messageOf(error)}`, {}, { cause: error })
+     }
++    if (path === undefined) {
++      throw new RemoteError('gateway/internal', 'settings provider has no local document to open', {})
++    }
++    // A headless serving host (no display server) cannot delegate to a desktop
++    // opener; hand the path back so the UI can show it instead of erroring.
++    if (!this.canOpenPath()) return { opened: false, path }
+     if (isAborted(signal)) throw new RemoteError('gateway/cancelled', 'settings document open was aborted', {})
+     try {
+       await this.openTextFile(path, signal)
+@@ -218,7 +238,7 @@ export class SettingsController extends TypertRemoteService {
+     if (settings === undefined) {
+       throw new RemoteError(
+         'gateway/internal',
+-        'settings service is absent: mount @deepseek-ai/dsh-settings with @deepseek-ai/dsh-config-editor in the profile composition',
++        'settings service is absent: this deployment does not mount a settings provider (e.g. @deepseek-ai/dsh-settings-file) in its composition',
+         {},
+       )
+     }
+diff --git a/packages/api/settings-controller/src/types.ts b/packages/api/settings-controller/src/types.ts
+index 3d11c6ab0c..43ec74d9fa 100644
+--- a/packages/api/settings-controller/src/types.ts
++++ b/packages/api/settings-controller/src/types.ts
+@@ -28,7 +28,16 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
+   }
+ }
+ 
+-/** Confirmation that the settings document was handed to the native editor. */
+-export interface SettingsDocumentOpenValue {
+-  readonly opened: true
+-}
++/**
++ * Result of opening the provider-owned settings document. When the serving Host
++ * has no native desktop opener (a headless server or container), it returns the
++ * document path so the UI can surface it instead of failing.
++ */
++export type SettingsDocumentOpenValue =
++  | { readonly opened: true }
++  | { readonly opened: false; readonly path: string }
++
++/** Result of opening or revealing one locally authored Agent preset directory. */
++export type AgentPresetDirectoryOpenValue =
++  | { readonly opened: true }
++  | { readonly opened: false; readonly path: string }
+diff --git a/packages/attachment/attachment-local/src/index.ts b/packages/attachment/attachment-local/src/index.ts
+index 2965fef0cc..f6fad3ac39 100644
+--- a/packages/attachment/attachment-local/src/index.ts
++++ b/packages/attachment/attachment-local/src/index.ts
+@@ -18,6 +18,7 @@ import type {
+ import { dshCachePath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+ import type { NormalizationPolicy } from './normalization.ts'
+ import { CompressionLimiter, compressionFailure } from './compression-limiter.ts'
++import { ensureStandardStreams } from './sharp.ts'
+ import { commitPreparedImageFile, normalizedImagePath, prepareImageFile, readImageFile, validateImageFile } from './store.ts'
+ import {
+   readFileStreamVerbatim, saveFileStreamVerbatim, saveFileVerbatim, storedFilePath,
+@@ -176,6 +177,13 @@ export class LocalAttachmentStore extends AttachmentStore {
+ 
+   constructor(ctx: Context, config: Config) {
+     super(ctx)
++    // Repair the standard descriptors while this service mounts rather than on
++    // the first raster operation: the FreeBSD WebAssembly Sharp backend reads
++    // them when it loads, and a broken descriptor turns that load into an
++    // unhandled rejection the launcher treats as a fatal boot failure. A
++    // descriptor that cannot be repaired here fails the mount instead, which is
++    // a startup error the operator can read rather than a crash mid-session.
++    ensureStandardStreams()
+     const dshHome = resolveDshHome(config.dshHome)
+     this.root = join(dshHome, 'attachments', 'v1')
+     this.cacheRoot = dshCachePath({ dshHome }, 'attachments')
+diff --git a/packages/attachment/attachment-local/src/sharp.ts b/packages/attachment/attachment-local/src/sharp.ts
+index 798b21ae4b..9a72853c39 100644
+--- a/packages/attachment/attachment-local/src/sharp.ts
++++ b/packages/attachment/attachment-local/src/sharp.ts
+@@ -1,7 +1,107 @@
+-/** Process-realm lazy access to Sharp's CommonJS-compatible entry. */
++/**
++ * Process-realm lazy access to Sharp's CommonJS-compatible entry, with the
++ * standard-descriptor repair its FreeBSD WebAssembly backend needs first.
++ *
++ * On FreeBSD, sharp resolves to `@img/sharp-freebsd-wasm32`. Its Emscripten
++ * runtime builds the `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` streams by
++ * calling `fstatSync` on descriptors 0, 1, and 2 while the module evaluates,
++ * and a descriptor that cannot be stat'ed makes that call throw `EBADF`. The
++ * failure arrives as an unhandled rejection (`ErrnoError`, errno 8) from the
++ * runtime's own async startup rather than as a thrown load error, so the module
++ * is left half initialized — the first raster operation then fails with
++ * `sharp.libvipsVersion is not a function` — and the harness treats the stray
++ * rejection as a fatal boot failure and exits. That is how reading one image
++ * could take the whole web service down.
++ *
++ * Repairing the three standard descriptors before the first load keeps that
++ * startup working. Because a runtime that already started unstatable cannot be
++ * repaired from JavaScript, the load is refused outright when a descriptor
++ * still cannot be stat'ed after the repair: refusing costs one clear tool error
++ * instead of a cached broken binding and a fatal process exit.
++ * @module @deepseek-ai/dsh-attachment-local/src/sharp
++ */
+ 
++import { closeSync, fstatSync, openSync } from 'node:fs'
+ import type sharp from 'sharp'
+ import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
+ 
+-/** Load Sharp on the first raster operation and retain its callable export. */
+-export const requireSharp = createLazyRequire<typeof sharp>('sharp', import.meta.url)
++/**
++ * Whether one standard descriptor can be stat'ed, which is exactly what Sharp's
++ * WebAssembly runtime requires of it. An absent descriptor is equally unusable,
++ * so both states take the same repair path.
++ * @param fd - standard descriptor number (0, 1, or 2).
++ * @returns whether `fstatSync` accepts the descriptor.
++ */
++function isStatable(fd: number): boolean {
++  try {
++    fstatSync(fd)
++    return true
++  } catch {
++    return false
++  }
++}
++
++/**
++ * Rebind one unusable standard descriptor to `/dev/null`. The original is
++ * closed first so `openSync`'s lowest-free-descriptor rule refills that exact
++ * slot; stdin is opened read-only and the output descriptors are opened for
++ * append, so a repaired stdout or stderr silently discards writes.
++ * @param fd - standard descriptor number to restore.
++ * @returns whether the descriptor is statable afterwards.
++ */
++function restoreStandardStream(fd: number): boolean {
++  try {
++    closeSync(fd)
++  } catch {
++    // An absent descriptor needs no close; a close that fails for any other
++    // reason leaves the slot occupied, which the reopen below reports.
++  }
++  try {
++    const opened = openSync('/dev/null', fd === 0 ? 'r' : 'a')
++    if (opened === fd) return true
++    closeSync(opened)
++  } catch {
++    // Fall through to the caller's refusal.
++  }
++  return false
++}
++
++/**
++ * Ensure descriptors 0, 1, and 2 can all be stat'ed, which is the precondition
++ * for loading Sharp's FreeBSD WebAssembly backend.
++ * @returns the repaired descriptor numbers in ascending order.
++ * @throws Error naming every descriptor that could not be restored.
++ */
++export function ensureStandardStreams(): number[] {
++  const repaired: number[] = []
++  const unrecoverable: number[] = []
++  for (const fd of [0, 1, 2]) {
++    if (isStatable(fd)) continue
++    if (restoreStandardStream(fd)) repaired.push(fd)
++    else unrecoverable.push(fd)
++  }
++  if (unrecoverable.length > 0) {
++    throw new Error(
++      `standard descriptor${unrecoverable.length === 1 ? '' : 's'} ${unrecoverable.join(', ')} cannot be stat'ed or rebound to /dev/null`,
++    )
++  }
++  return repaired
++}
++
++/** Load Sharp itself; {@link requireSharp} owns the descriptor repair around it. */
++const loadSharp = createLazyRequire<typeof sharp>('sharp', import.meta.url)
++
++/**
++ * Load Sharp once for this process, repairing the standard descriptors first.
++ *
++ * The repair precedes the load because the WebAssembly runtime reads those
++ * descriptors during module evaluation, and the load is skipped entirely when a
++ * descriptor stays unusable: an already-broken runtime would report the failure
++ * as an unhandled rejection rather than a catchable error.
++ * @returns the callable Sharp constructor.
++ * @throws Error when the standard descriptors cannot be made statable.
++ */
++export function requireSharp(): typeof sharp {
++  ensureStandardStreams()
++  return loadSharp()
++}
+diff --git a/packages/attachment/attachment-local/tests/standard-streams.spec.ts b/packages/attachment/attachment-local/tests/standard-streams.spec.ts
+new file mode 100644
+index 0000000000..352524f596
+--- /dev/null
++++ b/packages/attachment/attachment-local/tests/standard-streams.spec.ts
+@@ -0,0 +1,33 @@
++import { closeSync, writeSync } from 'node:fs'
++import { describe, expect, it } from 'vitest'
++import { ensureStandardStreams } from '../src/sharp.ts'
++
++/**
++ * The repair exists for the FreeBSD WebAssembly Sharp backend, whose Emscripten
++ * runtime calls `fstatSync` on descriptors 0, 1, and 2 while it evaluates. A
++ * descriptor that cannot be stat'ed makes that call throw `EBADF`, which the
++ * runtime reports as an unhandled rejection and leaves the binding half
++ * initialized. These cases close *stdin* only: it is the one standard
++ * descriptor the test runner does not report through, so a repaired slot cannot
++ * swallow the run's own output.
++ */
++describe('standard-descriptor repair', () => {
++  it('leaves statable descriptors untouched', () => {
++    expect(ensureStandardStreams()).toEqual([])
++  })
++
++  it('rebinds a closed stdin to /dev/null and reports it once', () => {
++    closeSync(0)
++
++    expect(ensureStandardStreams()).toEqual([0])
++    // Idempotent: the rebound descriptor is statable, so nothing is repaired again.
++    expect(ensureStandardStreams()).toEqual([])
++  })
++
++  it('keeps stdout usable when stdin had to be repaired', () => {
++    closeSync(0)
++    ensureStandardStreams()
++
++    expect(() => writeSync(1, '')).not.toThrow()
++  })
++})
+diff --git a/packages/client/ui-settings-general/src/client/SettingsDocumentAction.module.css b/packages/client/ui-settings-general/src/client/SettingsDocumentAction.module.css
+index c4bb82e12f..3a1a5269ed 100644
+--- a/packages/client/ui-settings-general/src/client/SettingsDocumentAction.module.css
++++ b/packages/client/ui-settings-general/src/client/SettingsDocumentAction.module.css
+@@ -14,3 +14,16 @@
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
++.path {
++  display: block;
++  max-width: 100%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++  font-size: 12px;
++  padding: 4px 8px;
++  border-radius: 4px;
++  background: rgba(0, 0, 0, 0.05);
++  color: inherit;
++}
+diff --git a/packages/client/ui-settings-general/src/client/SettingsDocumentAction.tsx b/packages/client/ui-settings-general/src/client/SettingsDocumentAction.tsx
+index bb4d0ca7a0..7a472b3bd9 100644
+--- a/packages/client/ui-settings-general/src/client/SettingsDocumentAction.tsx
++++ b/packages/client/ui-settings-general/src/client/SettingsDocumentAction.tsx
+@@ -38,6 +38,9 @@ export function SettingsDocumentAction({ controller, useSnapshot, t }: SettingsD
+   return (
+     <div className={css.action}>
+       {state.error === null ? null : <span className={css.error} role="alert">{t('openDocument.error')}</span>}
++      {state.path === null ? null : (
++        <code className={css.path} title={state.path}>{state.path}</code>
++      )}
+       <Button
+         variant="outline"
+         size="sm"
+diff --git a/packages/client/ui-settings-general/src/client/settings-document-store.ts b/packages/client/ui-settings-general/src/client/settings-document-store.ts
+index 1a5f45d7ee..bc6dfef0cd 100644
+--- a/packages/client/ui-settings-general/src/client/settings-document-store.ts
++++ b/packages/client/ui-settings-general/src/client/settings-document-store.ts
+@@ -14,13 +14,15 @@ export interface SettingsDocumentState {
+   opening: boolean
+   /** Last metadata/native-open diagnostic; UI exposes only localized copy. */
+   error: string | null
++  /** Resolved document path when the Host cannot open it natively (headless server). */
++  path: string | null
+ }
+ 
+ /** Derives local-document availability from the shared mirror and invokes the pathless Host-owned open operation. */
+ export class SettingsDocumentStore {
+   /** uSES-safe state source shared by the registered header action. */
+   readonly store: SnapshotStore<SettingsDocumentState> = createSnapshotStore({
+-    status: 'idle', opening: false, error: null,
++    status: 'idle', opening: false, error: null, path: null,
+   })
+ 
+   private following: (() => void) | undefined
+@@ -60,12 +62,19 @@ export class SettingsDocumentStore {
+     this.store.update((state) => {
+       state.opening = true
+       state.error = null
++      state.path = null
+     })
+     try {
+       const result = await this.ctx.remote.settings.openSettingsDocument()
+       if (!result.ok) {
+         const { message } = result.error
+         this.store.update((state) => { state.error = message })
++        return
++      }
++      // A headless serving Host returns the path instead of opening it natively.
++      const value = result.value as { readonly opened: boolean; readonly path?: string }
++      if (!value.opened && value.path !== undefined) {
++        this.store.update((state) => { state.path = value.path ?? null })
+       }
+     } finally {
+       this.store.update((state) => { state.opening = false })

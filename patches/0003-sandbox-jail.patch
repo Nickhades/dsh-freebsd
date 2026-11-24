@@ -1,0 +1,334 @@
+diff --git a/packages/sandbox/sandbox-local/src/index.ts b/packages/sandbox/sandbox-local/src/index.ts
+index af8dae004f..17c132423e 100644
+--- a/packages/sandbox/sandbox-local/src/index.ts
++++ b/packages/sandbox/sandbox-local/src/index.ts
+@@ -154,10 +154,12 @@ export interface SandboxInternals {
+   probeWindowsAcl?: () => boolean
+   /** Replaces the private-temp-directory removal at provider dispose (a throwing fake exercises the cleanup-failure path). */
+   rmTempDir?: (path: string) => void
++  /** Replaces the resolved `dsh-jail-run` binary path (a fake binary for probe tests). */
++  freebsdJailRunBin?: string
+ }
+ 
+ /** The chain's verdict: which runner confines, and how completely it enforces. */
+-type SelectedRunner = { runner: 'bwrap' | 'landlock' | 'seatbelt' | 'windows-acl'; enforcement: SandboxEnforcement }
++type SelectedRunner = { runner: 'bwrap' | 'landlock' | 'seatbelt' | 'windows-acl' | 'freebsd-jail'; enforcement: SandboxEnforcement }
+ 
+ /** One live session/workspace pair's private temp directory and capability. */
+ interface AclTempCapability {
+@@ -182,8 +184,18 @@ const PLATFORM_CHAINS: Record<string, readonly SelectedRunner['runner'][]> = {
+   // a sole candidate, selected without a probe — its execution-time refusal
+   // fails closed through its stderr signature (windows-acl-run:) and exit 127.
+   win32: ['windows-acl'],
++  // FreeBSD confines via a real jail(2) backend driven by the setuid-root
++  // `dsh-jail-run` helper (freebsd/dsh-jail-run.c). The helper is a sole
++  // candidate: its presence is mandatory, so chainVerdict probes it even as a
++  // sole candidate and fails closed with SANDBOX_UNAVAILABLE when the helper is
++  // absent (rather than a confusing spawn ENOENT). `danger-full-access` remains
++  // the explicit escape hatch; there is intentionally no full-access fallback.
++  freebsd: ['freebsd-jail'],
+ }
+ 
++/** Runners that must be functionally probed even as a sole candidate (their backend depends on an externally-installed helper). */
++const PROBE_SOLE_CANDIDATES = new Set<SelectedRunner['runner']>(['freebsd-jail'])
++
+ /**
+  * Enforcement completeness a rung claims when selected WITHOUT a probe (a
+  * chain of one). `bwrap` and Seatbelt govern every promised file effect by
+@@ -204,6 +216,10 @@ const STATIC_ENFORCEMENT: Record<SelectedRunner['runner'], SandboxEnforcement> =
+   // child: the backend enforces the remaining ACL-addressable surface but
+   // must not advertise the absolute promise.
+   'windows-acl': 'partial',
++  // The jail(2) backend governs every promised file effect by construction (a
++  // read-only nullfs for read-only mode, a read-write workspace bind for
++  // workspace-write), so it claims the full promise.
++  'freebsd-jail': 'full',
+ }
+ 
+ /**
+@@ -229,6 +245,9 @@ const DENIAL_SIGNATURES = {
+   // pwsh/.NET: "Access to the path '...' is denied."; cmd: "Access is denied.";
+   // Node EACCES: "permission denied"; EPERM: "operation not permitted".
+   'windows-acl': ['access is denied', 'access to the path', 'permission denied', 'operation not permitted'],
++  // nullfs EROFS on a read-only workspace bind; EACCES/EPERM on devfs or
++  // path-traversal attempts outside the jail.
++  'freebsd-jail': ['read-only file system', 'permission denied', 'operation not permitted'],
+   runnerCommand: ['read-only file system', 'permission denied'],
+ } as const satisfies Record<SelectedRunner['runner'] | 'runnerCommand', readonly string[]>
+ 
+@@ -257,6 +276,9 @@ const RUNNER_FAILURE_RULES = {
+   }],
+   seatbelt: [{ fatalSignatures: ['sandbox-exec: '] }],
+   'windows-acl': [{ allowedExitCodes: [WINDOWS_ACL_RUNNER_FAILURE_EXIT], fatalSignatures: ['windows-acl-run: '] }],
++  // The setuid helper prints `dsh-jail-run: <detail>` on every runner-side
++  // failure (bad workspace, missing mount, jail create failure) and exits 125.
++  'freebsd-jail': [{ allowedExitCodes: [125], fatalSignatures: ['dsh-jail-run: '] }],
+ } as const satisfies Record<SelectedRunner['runner'], readonly RunnerFailureRule[]>
+ 
+ /**
+@@ -368,6 +390,7 @@ export class LocalSandboxProvider extends SandboxProvider {
+       case 'landlock': return [this.landlockLauncher(), ...landlockProfileArgs(policy)]
+       case 'seatbelt': return [this.seatbeltExec(), ...seatbeltProfileArgs(policy)]
+       case 'windows-acl': return this.windowsAclRunnerArgv(policy)
++      case 'freebsd-jail': return [this.freebsdJailRunBin(), '--workspace', policy.workspaceRoot, '--mode', policy.mode]
+       default: return assertNever(runner)
+     }
+   }
+@@ -554,8 +577,18 @@ export class LocalSandboxProvider extends SandboxProvider {
+     const chain = this.internals.chain ?? PLATFORM_CHAINS[this.internals.platform ?? process.platform] ?? []
+     const [first, ...rest] = chain
+     if (first === undefined) return 'unavailable'
+-    // A sole candidate needs no arbitration; its execution-time refusal still fails closed.
+-    if (rest.length === 0) return { runner: first, enforcement: STATIC_ENFORCEMENT[first] }
++    // A sole candidate needs no arbitration; its execution-time refusal still
++    // fails closed. The FreeBSD jail backend is the exception: it depends on an
++    // externally-installed setuid helper (`dsh-jail-run`), so its absence must
++    // fail closed with a clean SANDBOX_UNAVAILABLE (plus the install hint)
++    // rather than a confusing spawn ENOENT at command time.
++    if (rest.length === 0) {
++      if (PROBE_SOLE_CANDIDATES.has(first)) {
++        const enforcement = this.probeRunner(first)
++        return enforcement === 'unusable' ? 'unavailable' : { runner: first, enforcement }
++      }
++      return { runner: first, enforcement: STATIC_ENFORCEMENT[first] }
++    }
+     for (const runner of chain) {
+       const enforcement = this.probeRunner(runner)
+       if (enforcement !== 'unusable') return { runner, enforcement }
+@@ -589,6 +622,12 @@ export class LocalSandboxProvider extends SandboxProvider {
+           ?? (() => defaultProbeWindowsAcl(this.windowsAclRunnerInvocation(), this.probeTimeoutMs))
+         return probe() ? 'partial' : 'unusable'
+       }
++      case 'freebsd-jail': {
++        // The backend is a separate setuid helper; its mere presence is the
++        // functional probe — absence means the host has no usable jail backend.
++        const bin = this.freebsdJailRunBin()
++        return existsSync(bin) ? 'full' : 'unusable'
++      }
+       default: return assertNever(runner)
+     }
+   }
+@@ -603,6 +642,18 @@ export class LocalSandboxProvider extends SandboxProvider {
+     return this.internals.seatbeltExec ?? 'sandbox-exec'
+   }
+ 
++  /**
++   * The `dsh-jail-run` setuid helper to probe and exec. Resolution order: the
++   * test hook (internals), then `DSH_JAIL_RUN_BIN`, then the default install
++   * path `/usr/local/sbin/dsh-jail-run`. The helper is a separate setuid-root
++   * binary (freebsd/dsh-jail-run.c) — see FREEBSD.md.
++   */
++  private freebsdJailRunBin(): string {
++    return this.internals.freebsdJailRunBin
++      ?? process.env.DSH_JAIL_RUN_BIN
++      ?? '/usr/local/sbin/dsh-jail-run'
++  }
++
+   /**
+    * The windows-acl runner argv prefix: the built lib/runner.js entry when
+    * present (production), else the package source through tsx (development).
+diff --git a/packages/sandbox/sandbox-local/tests/freebsd-jail.e2e.ts b/packages/sandbox/sandbox-local/tests/freebsd-jail.e2e.ts
+new file mode 100644
+index 0000000000..5e377049c7
+--- /dev/null
++++ b/packages/sandbox/sandbox-local/tests/freebsd-jail.e2e.ts
+@@ -0,0 +1,114 @@
++import { spawnSync } from 'node:child_process'
++import { existsSync, readFileSync, rmSync } from 'node:fs'
++import { mkdtemp, rm } from 'node:fs/promises'
++import { homedir, tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
++import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local'
++
++/**
++ * FreeBSD jail backend integration through `confine()` and a real `dsh-jail-run`
++ * setuid helper (freebsd/dsh-jail-run.c). The helper is a sole candidate: its
++ * presence is the probe, and its absence fails closed with SANDBOX_UNAVAILABLE
++ * (see PROBE_SOLE_CANDIDATES in src/index.ts). Tests assert world effects, wrap
++ * shape, and that the kernel denial matches the advertised dialect; consumer
++ * coverage lives in dsh-bash-sandbox. Skips off-FreeBSD or when the setuid
++ * helper is absent. HOME-based workspaces avoid the jail's ephemeral /tmp, so
++ * workspace-write actually proves the workspace-root rebind.
++ */
++
++const jailBin = process.env.DSH_JAIL_RUN_BIN ?? '/usr/local/sbin/dsh-jail-run'
++const freebsdJailUsable = process.platform === 'freebsd' && existsSync(jailBin)
++
++let ctx: Context | undefined
++const tempDirs: string[] = []
++const tempFiles: string[] = []
++
++afterEach(async () => {
++  await ctx?.fiber.dispose()
++  ctx = undefined
++  await Promise.all(tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
++  for (const file of tempFiles.splice(0)) rmSync(file, { force: true })
++})
++
++async function tempDir(base: string): Promise<string> {
++  const dir = await mkdtemp(join(base, 'dsh-freebsd-e2e-'))
++  tempDirs.push(dir)
++  return dir
++}
++
++async function provider(): Promise<LocalSandboxProvider> {
++  ctx = new Context()
++  await ctx.plugin(LocalSandboxProvider, {})
++  return ctx.sandbox as LocalSandboxProvider
++}
++
++/** Confine a shell command under `policy` and run it for real; returns the spawn result and the wrap's facts. */
++async function runConfined(sandbox: LocalSandboxProvider, command: string, policy: SandboxPolicy) {
++  const confined = await sandbox.confine(['bash', '-c', command], policy)
++  const result = spawnSync(confined.argv[0] as string, confined.argv.slice(1), { timeout: 30_000, encoding: 'utf8' })
++  return { result, confined }
++}
++
++describe.skipIf(!freebsdJailUsable)('sandbox-local: real FreeBSD jail confinement', () => {
++  it('selects the freebsd-jail rung — full enforcement, EROFS dialect', async () => {
++    const workdir = await tempDir(tmpdir())
++    const sandbox = await provider()
++    const confined = await sandbox.confine(['true'], { mode: 'read-only', workspaceRoot: workdir })
++    expect(confined.argv[0]).toBe(jailBin)
++    expect(confined.argv).toContain('--workspace')
++    expect(confined.argv).toContain(workdir)
++    expect(confined.argv).toContain('--mode')
++    expect(confined.argv).toContain('read-only')
++    expect(confined.enforcement).toBe('full')
++    expect(confined.denialSignatures).toEqual(['read-only file system', 'permission denied', 'operation not permitted'])
++  })
++
++  it('read-only denies a write — the file must NOT exist, and the kernel speaks the advertised dialect', async () => {
++    const workdir = await tempDir(tmpdir())
++    const sandbox = await provider()
++    const { result } = await runConfined(sandbox, 'echo hi > /workspace/denied.txt', { mode: 'read-only', workspaceRoot: workdir })
++    expect(result.status).not.toBe(0)
++    // The wrap's denialSignatures must be what the kernel actually prints.
++    expect(result.stderr.toLowerCase()).toContain('read-only file system')
++    expect(existsSync(join(workdir, 'denied.txt'))).toBe(false)
++  })
++
++  it('read-only keeps the tree readable/executable and the fresh /dev/null writable', async () => {
++    const workdir = await tempDir(tmpdir())
++    const sandbox = await provider()
++    const { result } = await runConfined(sandbox, 'ls /bin > /dev/null && test -x /bin/sh && echo dev-ok', { mode: 'read-only', workspaceRoot: workdir })
++    expect(result.status).toBe(0)
++    expect(result.stdout).toBe('dev-ok\n')
++  })
++
++  it('workspace-write lands a write inside the workspace root and still denies one beside it', async () => {
++    const workdir = await tempDir(homedir())
++    const sandbox = await provider()
++
++    const inside = await runConfined(sandbox, 'printf jail-ok > /workspace/allowed.txt', { mode: 'workspace-write', workspaceRoot: workdir })
++    expect(inside.result.status).toBe(0)
++    expect(readFileSync(join(workdir, 'allowed.txt'), 'utf8')).toBe('jail-ok')
++
++    const denied = await runConfined(sandbox, 'echo hi > /etc/denied.txt', { mode: 'workspace-write', workspaceRoot: workdir })
++    expect(denied.result.status).not.toBe(0)
++    // /etc is a read-only nullfs mount, so the kernel denies with EROFS — the
++    // harness's advertised denial dialect for this backend.
++    expect(denied.result.stderr.toLowerCase()).toContain('read-only file system')
++  })
++
++  it('workspace-write mounts an EPHEMERAL /tmp: the write succeeds inside, the host /tmp stays untouched', async () => {
++    // The jail swaps in a fresh tmpfs at /tmp that dies with the jail, so a
++    // write there never reaches the host /tmp — the strongest temp semantics.
++    const workdir = await tempDir(homedir())
++    const target = `/tmp/dsh-freebsd-e2e-ephemeral-${process.pid}.txt`
++    tempFiles.push(target)
++    const sandbox = await provider()
++    const { result } = await runConfined(sandbox, `printf tmp-ok > ${target} && cat ${target}`, { mode: 'workspace-write', workspaceRoot: workdir })
++    expect(result.status).toBe(0)
++    expect(result.stdout).toBe('tmp-ok')
++    expect(existsSync(target)).toBe(false)
++  })
++})
+diff --git a/packages/sandbox/sandbox-local/tests/local.spec.ts b/packages/sandbox/sandbox-local/tests/local.spec.ts
+index 7da5f02415..cae70ecbd4 100644
+--- a/packages/sandbox/sandbox-local/tests/local.spec.ts
++++ b/packages/sandbox/sandbox-local/tests/local.spec.ts
+@@ -263,7 +263,10 @@ describe('the platform chains', () => {
+     const probeBwrap = vi.fn(() => true)
+     const probeLandlock = vi.fn(() => 'full' as const)
+     const probeSeatbelt = vi.fn(() => true)
+-    const { sandbox } = await setup({}, { platform: 'freebsd', probeBwrap, probeLandlock, probeSeatbelt })
++    // FORK NOTE (FreeBSD port): this example used to be `freebsd`, but the port
++    // gives FreeBSD a real chain (freebsd-jail, see PLATFORM_CHAINS), so the
++    // chain-less example is now a platform the provider has no rung for at all.
++    const { sandbox } = await setup({}, { platform: 'openbsd', probeBwrap, probeLandlock, probeSeatbelt })
+     await expect(sandbox.confine(['true'], RO)).rejects.toThrow(expect.objectContaining({ name: 'SandboxUnavailableError', code: SANDBOX_UNAVAILABLE }))
+     expect(probeBwrap).not.toHaveBeenCalled()
+     expect(probeLandlock).not.toHaveBeenCalled()
+diff --git a/packages/sandbox/sandbox/src/index.ts b/packages/sandbox/sandbox/src/index.ts
+index 69d9100f66..caef917c91 100644
+--- a/packages/sandbox/sandbox/src/index.ts
++++ b/packages/sandbox/sandbox/src/index.ts
+@@ -5,6 +5,7 @@
+  * @module @deepseek-ai/dsh-sandbox
+  */
+ 
++import { existsSync } from 'node:fs'
+ import { Context, Service } from '@deepseek-ai/cordis'
+ import { HarnessError } from '@deepseek-ai/dsh-llm'
+ import type { SessionId } from '@deepseek-ai/dsh-session'
+@@ -149,10 +150,8 @@ export class SandboxUnavailableError extends HarnessError {
+   constructor(mode: ConfinedSandboxMode, detail?: string) {
+     super(
+       `sandbox mode "${mode}" is requested but no sandbox backend is usable on this host; `
+-      + 'refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing '
+-      + 'kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL '
+-      + 'restricted-token runner can start (Windows) — otherwise switch the consumer to '
+-      + 'danger-full-access.'
++      + 'refusing to run the command unconfined. '
++      + sandboxUnavailableHint()
+       + (detail === undefined ? '' : ` Runner failure: ${detail}`),
+       SANDBOX_UNAVAILABLE,
+     )
+@@ -160,6 +159,43 @@ export class SandboxUnavailableError extends HarnessError {
+   }
+ }
+ 
++/**
++ * Platform-specific recovery guidance appended to {@link SandboxUnavailableError}.
++ * FreeBSD ships no sandbox backend in this build — the runners it knows are
++ * Linux bwrap/Landlock, macOS Seatbelt, and the Windows ACL restricted-token
++ * runner — so the generic "install bubblewrap" advice does not apply. The only
++ * way to run a confined consumer on FreeBSD is to switch it to
++ * `danger-full-access`; spell that out so a FreeBSD operator is not sent
++ * looking for a Linux/macOS/Windows runner that will never exist on their host.
++ * Every other platform keeps the original runner-install guidance verbatim.
++ */
++function sandboxUnavailableHint(): string {
++  if (process.platform === 'freebsd') {
++    const bin = process.env.DSH_JAIL_RUN_BIN ?? '/usr/local/sbin/dsh-jail-run'
++    if (existsSync(bin)) {
++      return 'This host runs FreeBSD and the jail sandbox backend (`dsh-jail-run`) is installed '
++        + 'but reported unusable — see the runner diagnostics above. If the setuid helper cannot '
++        + 'run on this host, switch the consumer to `danger-full-access`: launch with '
++        + 'DSH_PERMISSION_MODE=danger-full-access, or pick the danger-full-access permission preset in the UI. '
++    }
++    return 'This host runs FreeBSD. Install and enable the `dsh-jail-run` setuid helper '
++      + '(see FREEBSD.md / FREEBSD.zh.md) to run confined via a FreeBSD jail; if the helper '
++      + 'cannot be installed, switch the consumer to `danger-full-access`: launch with '
++      + 'DSH_PERMISSION_MODE=danger-full-access, or pick the danger-full-access permission preset in the UI. '
++  }
++  return 'Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec '
++    + 'is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) '
++    + '— otherwise switch the consumer to danger-full-access.'
++}
++
++/** The selected backend is available but cannot enforce the requested policy. */
++export class SandboxUnsupportedPolicyError extends HarnessError {
++  constructor(detail: string) {
++    super(detail, 'SANDBOX_UNSUPPORTED_POLICY')
++    this.name = 'SandboxUnsupportedPolicyError'
++  }
++}
++
+ /**
+  * Every {@link SandboxPreparationError} code:
+  * - `SANDBOX_PREPARATION_FAILED` — the provider could not set up host state the confined process needs, such as a

@@ -1,0 +1,17 @@
+# dsh FreeBSD overlay - pinned upstream identity.
+# Sourced by scripts/*.sh. Keep every value shell-safe (no spaces).
+
+# Canonical upstream source. Override with DSH_UPSTREAM_REPO for a mirror.
+UPSTREAM_REPO="https://github.com/deepseek-ai/deepseek-harness.git"
+UPSTREAM_TAG="dsh-v0.2.2-rc.5"
+UPSTREAM_COMMIT="9c2670d3bce5275e0d1610272958121af87787bb"
+
+# Identity of this overlay revision.
+OVERLAY_VERSION="0.2.2-rc.5-fbsd.1"
+
+# Supported host line. 14.3 also builds; 15.x is the verified target.
+MIN_FREEBSD_MAJOR=15
+
+# Upstream engines require >=24.9. 22.19+ builds with a warning.
+MIN_NODE_VERSION="22.19.0"
+RECOMMENDED_NODE_VERSION="24.9.0"

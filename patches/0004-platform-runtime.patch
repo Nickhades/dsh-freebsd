@@ -1,0 +1,680 @@
+diff --git a/apps/web/src/main.ts b/apps/web/src/main.ts
+index 5f4786acb7..c0d183e115 100644
+--- a/apps/web/src/main.ts
++++ b/apps/web/src/main.ts
+@@ -1,4 +1,5 @@
+ /** Browser entry for the Web client. */
++import './polyfill-crypto'
+ import '@deepseek-ai/dsh-client-ui-theme/brand-font.css'
+ import { AppWebEntry, applyIndexInjections } from '@deepseek-ai/dsh-client-web'
+ 
+diff --git a/apps/web/src/polyfill-crypto.ts b/apps/web/src/polyfill-crypto.ts
+new file mode 100644
+index 0000000000..80eb46a5d8
+--- /dev/null
++++ b/apps/web/src/polyfill-crypto.ts
+@@ -0,0 +1,25 @@
++/** Polyfill crypto.randomUUID for non-secure contexts (plain http on a LAN IP),
++ * where browsers gate the Web Crypto randomUUID API off. getRandomValues is
++ * available in every context, so we derive an RFC4122 v4 UUID from it.
++ */
++const __dshCrypto = globalThis.crypto as any
++if (__dshCrypto && typeof __dshCrypto.randomUUID !== "function") {
++  __dshCrypto.randomUUID = function (): string {
++    const bytes = new Uint8Array(16)
++    globalThis.crypto.getRandomValues(bytes)
++    bytes[6] = (bytes[6]! & 0x0f) | 0x40
++    bytes[8] = (bytes[8]! & 0x3f) | 0x80
++    const hex = Array.from(bytes, (b: number) => b.toString(16).padStart(2, "0"))
++    return (
++      hex.slice(0, 4).join("") +
++      "-" +
++      hex.slice(4, 6).join("") +
++      "-" +
++      hex.slice(6, 8).join("") +
++      "-" +
++      hex.slice(8, 10).join("") +
++      "-" +
++      hex.slice(10, 16).join("")
++    )
++  }
++}
+diff --git a/packages/boot/app-boot/src/profile-resolution/resolver.ts b/packages/boot/app-boot/src/profile-resolution/resolver.ts
+index 468ec82e24..87fe336be2 100644
+--- a/packages/boot/app-boot/src/profile-resolution/resolver.ts
++++ b/packages/boot/app-boot/src/profile-resolution/resolver.ts
+@@ -732,7 +732,10 @@ class ResolutionRouter {
+ 
+ function internalModules(): InternalModules {
+   const require = createRequire(import.meta.url)
+-  const addon = require('node-addon-require-builtin') as { requireBuiltin(moduleId: string): unknown }
++  const addon: { requireBuiltin(moduleId: string): unknown } =
++    process.platform === 'freebsd'
++      ? { requireBuiltin: (moduleId: string) => require(moduleId) }
++      : (require('node-addon-require-builtin') as { requireBuiltin(moduleId: string): unknown })
+   const esmModule = addon.requireBuiltin('internal/modules/esm/loader') as {
+     getOrInitializeCascadedLoader(): ModuleLoaderV1 | ModuleLoaderV2
+   }
+diff --git a/packages/fs/tool-fs-search/tests/rg-path.spec.ts b/packages/fs/tool-fs-search/tests/rg-path.spec.ts
+index 7369ef521c..9bf6b8abcc 100644
+--- a/packages/fs/tool-fs-search/tests/rg-path.spec.ts
++++ b/packages/fs/tool-fs-search/tests/rg-path.spec.ts
+@@ -4,9 +4,19 @@
+  * tools.spec.ts; here the module is mocked to throw at evaluation, proving a
+  * missing or corrupt platform package (`--omit=optional`, partial install)
+  * surfaces as a per-call `SEARCH_FAILED` — not a composition-load failure.
++ *
++ * FORK NOTE (FreeBSD port): `resolveRgPath` also falls back to a system `rg`
++ * found on `PATH`, because `@vscode/ripgrep` ships no FreeBSD binary and
++ * `pkg install ripgrep` is the only usable source. A test that means "nothing
++ * usable exists" must therefore hide `PATH` too — otherwise any host that
++ * happens to have ripgrep installed (all GitHub runners, and this repo's own
++ * FreeBSD boxes) resolves successfully and these assertions never bite.
+  */
+ 
+-import { describe, expect, it, vi } from 'vitest'
++import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { Context } from '@deepseek-ai/cordis'
+ import { ToolCallId } from '@deepseek-ai/dsh-llm'
+ import type { ToolExecution } from '@deepseek-ai/dsh-tools'
+@@ -20,7 +30,28 @@ vi.mock('@vscode/ripgrep', () => new Proxy({}, {
+   },
+ }))
+ 
++// Capture the env override at module load so beforeEach/afterEach can make it
++// truly absent rather than empty string. The resolveRgPath guard is
++// `override !== undefined && existsSync(override)`: setting the var to '' only
++// survives because the real existsSync('') is false here. Deleting it is the
++// honest "no override" signal and stays correct even if existsSync is later
++// mocked in this file.
++const originalRipgrepOverride = process.env.DSH_RIPGREP_PATH
++
+ describe('lazy packaged-ripgrep resolution', () => {
++  beforeEach(() => {
++    // Remove every usable candidate: the mocked platform package (above), the
++    // env override (must be ABSENT, not ''), and the system `rg` on PATH.
++    vi.stubEnv('PATH', '/nonexistent-dsh-ripgrep-test')
++    delete process.env.DSH_RIPGREP_PATH
++  })
++
++  afterEach(() => {
++    vi.unstubAllEnvs()
++    if (originalRipgrepOverride === undefined) delete process.env.DSH_RIPGREP_PATH
++    else process.env.DSH_RIPGREP_PATH = originalRipgrepOverride
++  })
++
+   it('fails the first search call with SEARCH_FAILED instead of failing module load', async () => {
+     // The resolution rejects before any spawn, so no subprocess service is needed.
+     const controller = new AbortController()
+@@ -30,8 +61,22 @@ describe('lazy packaged-ripgrep resolution', () => {
+       .rejects.toMatchObject({ name: 'SearchError', code: 'SEARCH_FAILED' })
+   })
+ 
+-  it('keeps failing every subsequent call (the resolution is memoized)', async () => {
++  it('does not memoize a failure, so a system rg installed later is picked up', async () => {
++    // Nothing usable yet: both calls must reject. Upstream memoizes the first
++    // rejection; the fork deliberately does not, so a `pkg install ripgrep`
++    // after the harness booted is honoured by the very next search.
+     await expect(resolveRgPath()).rejects.toThrow(/platform package/)
+     await expect(resolveRgPath()).rejects.toThrow(/platform package/)
++
++    const binDir = mkdtempSync(join(tmpdir(), 'dsh-rg-'))
++    try {
++      const fakeRg = join(binDir, 'rg')
++      writeFileSync(fakeRg, '#!/bin/sh\nexit 1\n')
++      chmodSync(fakeRg, 0o755)
++      vi.stubEnv('PATH', binDir)
++      await expect(resolveRgPath()).resolves.toBe(fakeRg)
++    } finally {
++      rmSync(binDir, { recursive: true, force: true })
++    }
+   })
+ })
+diff --git a/packages/fs/tool-fs-search/tests/tools.spec.ts b/packages/fs/tool-fs-search/tests/tools.spec.ts
+index 41a1510f8c..6172b812f3 100644
+--- a/packages/fs/tool-fs-search/tests/tools.spec.ts
++++ b/packages/fs/tool-fs-search/tests/tools.spec.ts
+@@ -24,7 +24,6 @@ import ToolRuntime, { TOOL_ABORTED_BEFORE_DISPATCH, type ToolExecution, type Too
+ import { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+ import type { SubprocessCollectedOutputs, SubprocessHandle, SubprocessOutcome, SubprocessOutputRead, SubprocessOutputReader, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+-import { rgPath } from '@vscode/ripgrep'
+ import { SpillLocator, SpillStore } from '@deepseek-ai/dsh-spill'
+ import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
+ import * as ToolFsSearch from '@deepseek-ai/dsh-tool-fs-search'
+@@ -52,6 +51,16 @@ declare module '@deepseek-ai/dsh-llm' {
+ 
+ const testToolSignal = new AbortController().signal
+ 
++/**
++ * FORK NOTE (FreeBSD port): `@vscode/ripgrep` has no `freebsd-x64`
++ * optionalDependency and THROWS at import there, which used to fail this whole
++ * file at collection. The port resolves ripgrep through the harness's own chain
++ * instead — the packaged path wherever it exists, a system `rg` on FreeBSD —
++ * which is exactly what the code under test calls, so the argv/identity
++ * assertions below stay meaningful on every platform.
++ */
++const rgPath = await import('@vscode/ripgrep').then(module => module.rgPath, () => resolveRgPath())
++
+ /**
+  * Normalize a POSIX-style test path to the platform separator: the sampler and
+  * the workdir-relative display conversion group by `node:path.sep`, so
+@@ -543,14 +552,18 @@ describe('workdir derivation and signal forwarding', () => {
+     expect(text(result)).toContain('aborted before completion')
+   })
+ 
+-  it('resolves the packaged ripgrep path lazily, once per process', async () => {
++  it('resolves the ripgrep path lazily, at each call rather than once per process', async () => {
+     // The module must not touch @vscode/ripgrep at load (a missing platform
+-    // package would otherwise fail the whole composition), and repeated
+-    // resolution reuses the first result. The resolution-failure path is
+-    // pinned separately in rg-path.spec.ts.
++    // package would otherwise fail the whole composition). The resolution-
++    // failure path is pinned separately in rg-path.spec.ts.
++    //
++    // FORK NOTE (FreeBSD port): upstream reused the first promise for the whole
++    // process. The port deliberately resolves at each call instead, so a system
++    // `rg` installed after boot is picked up by the very next search without
++    // restarting the harness (see the contract on resolveRgPath).
+     await setup()
+     expect(await resolveRgPath()).toBe(rgPath)
+-    expect(resolveRgPath()).toBe(resolveRgPath())
++    expect(resolveRgPath()).not.toBe(resolveRgPath())
+   })
+ 
+   it('rejects when the subprocess implementation drops a requested collect stream', async () => {
+diff --git a/packages/subprocess/subprocess-local/src/process-inspector.ts b/packages/subprocess/subprocess-local/src/process-inspector.ts
+index e357fd680a..74b3e31782 100644
+--- a/packages/subprocess/subprocess-local/src/process-inspector.ts
++++ b/packages/subprocess/subprocess-local/src/process-inspector.ts
+@@ -360,7 +360,15 @@ function syscallWaitsOnStdin(
+ abstract class PosixProcessInspector implements ProcessInspector {
+   constructor(protected readonly internals: ProcessInspectorInternals) {}
+ 
+-  abstract foregroundPgid(shellPid: number): number | undefined
++  foregroundPgid(shellPid: number): number | undefined {
++    try {
++      const value = Number(this.internals.exec('/bin/ps', ['-o', 'tpgid=', '-p', String(shellPid)]).trim())
++      return Number.isSafeInteger(value) && value > 0 ? value : undefined
++    } catch (_missingProcess) {
++      return undefined
++    }
++  }
++
+   abstract isStdinWaiting(pgid: number, shellPid: number): boolean
+   abstract snapshot(): ProcessSnapshot
+   abstract isAlive(identity: ProcessIdentity): boolean
+@@ -444,7 +452,7 @@ class LinuxProcessInspector extends PosixProcessInspector {
+     super(internals)
+   }
+ 
+-  foregroundPgid(shellPid: number): number | undefined {
++  override foregroundPgid(shellPid: number): number | undefined {
+     const tpgid = readLinuxStat(this.internals, shellPid)?.tpgid
+     return tpgid !== undefined && tpgid > 0 ? tpgid : undefined
+   }
+@@ -516,15 +524,6 @@ function macProcessTable(internals: ProcessInspectorInternals): { rows: ProcessR
+ }
+ 
+ class MacProcessInspector extends PosixProcessInspector {
+-  foregroundPgid(shellPid: number): number | undefined {
+-    try {
+-      const value = Number(this.internals.exec('/bin/ps', ['-o', 'tpgid=', '-p', String(shellPid)]).trim())
+-      return Number.isSafeInteger(value) && value > 0 ? value : undefined
+-    } catch (_missingProcess) {
+-      return undefined
+-    }
+-  }
+-
+   isStdinWaiting(_pgid: number, _shellPid: number): boolean {
+     return false
+   }
+@@ -541,6 +540,46 @@ class MacProcessInspector extends PosixProcessInspector {
+ 
+ }
+ 
++class FreeBSDProcessInspector extends PosixProcessInspector {
++  isStdinWaiting(_pgid: number, _shellPid: number): boolean {
++    return false
++  }
++
++  processTree(rootPid: number): ProcessIdentity[] {
++    return processTree(freebsdProcessTable(this.internals), rootPid)
++  }
++
++  processSession(_sessionId: number): ProcessIdentity[] {
++    return []
++  }
++
++  isAlive(identity: ProcessIdentity): boolean {
++    return freebsdProcessTable(this.internals).some(entry => entry.pid === identity.pid && entry.started === identity.started)
++  }
++
++  snapshot(): ProcessSnapshot {
++    return new PosixProcessSnapshot(freebsdProcessTable(this.internals), true)
++  }
++
++}
++
++function freebsdProcessTable(internals: ProcessInspectorInternals): ProcessRow[] {
++  return internals.exec('/bin/ps', ['-axo', 'pid,ppid,lstart'])
++    .split('\n')
++    .slice(1)
++    .flatMap((line) => {
++      const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line)
++      if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined) return []
++      return [{
++        pid: Number(match[1]),
++        parentPid: Number(match[2]),
++        started: match[3],
++        session: undefined,
++        state: undefined,
++      }]
++    })
++}
++
+ /**
+  * Create the supported platform inspector or fail at plugin load.
+  * @param platform - target Node platform.
+@@ -555,6 +594,7 @@ export function createProcessInspector(
+ ): ProcessInspector {
+   if (platform === 'linux') return new LinuxProcessInspector(arch, internals)
+   if (platform === 'darwin') return new MacProcessInspector(internals)
++  if (platform === 'freebsd') return new FreeBSDProcessInspector(internals)
+   if (platform === 'win32') return createWindowsProcessInspector()
+   throw new Error(`subprocess-local: terminal inspection is unsupported on platform ${platform}`)
+ }
+diff --git a/packages/terminal/terminal-bash/src/config.ts b/packages/terminal/terminal-bash/src/config.ts
+index 7cb37f1be7..4da54f8869 100644
+--- a/packages/terminal/terminal-bash/src/config.ts
++++ b/packages/terminal/terminal-bash/src/config.ts
+@@ -1,8 +1,38 @@
+ /** Validated configuration for the local PTY backend. */
+ 
+ import z from '@deepseek-ai/schemastery'
++import { existsSync } from 'node:fs'
+ import { resolvePwshPath } from '@deepseek-ai/dsh-pwsh-local'
+ 
++/**
++ * Resolve the default interactive shell for the current platform.
++ *
++ * FreeBSD does **not** ship bash in a default install -- its base interactive
++ * shell is `/bin/sh`, an ash derivative. The terminal-bash backend, however,
++ * depends on bash-specific behaviour:
++ *   - `PROMPT_COMMAND` (set in `childEnvironment`) emits the per-prompt OSC
++ *     `133;D;` marker the sanitizer uses to detect prompt boundaries and command
++ *     exit status; ash does not honor `PROMPT_COMMAND`.
++ *   - The default `shellArgs` (`--noprofile --norc -i`) are bash-only flags; ash
++ *     treats `--noprofile`/`--norc` as script filenames and fails to start.
++ * So on FreeBSD we resolve bash from its usual ports location and let
++ * `validateConfig` fail loudly (with install instructions) when it is absent,
++ * instead of producing a cryptic "PTY shell exited during startup" at spawn.
++ */
++function defaultShellPath(): string {
++  if (process.platform === 'freebsd') {
++    for (const candidate of ['/usr/local/bin/bash', '/bin/bash', '/usr/bin/bash']) {
++      try {
++        if (existsSync(candidate)) return candidate
++      } catch {
++        // ignore and try the next candidate
++      }
++    }
++    return '/usr/local/bin/bash'
++  }
++  return '/bin/bash'
++}
++
+ /** One supported interactive shell dialect. */
+ export type ShellDialect = 'bash' | 'pwsh'
+ 
+@@ -82,7 +112,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
+     shellDialect,
+     shellPath: config.shellPath !== undefined && config.shellPath.length > 0
+       ? config.shellPath
+-      : (shellDialect === 'pwsh' ? resolvePwshPath() : DEFAULT_BASH_SHELL),
++      : (shellDialect === 'pwsh' ? resolvePwshPath() : defaultShellPath()),
+     shellArgs: config.shellArgs !== undefined && config.shellArgs.length > 0
+       ? config.shellArgs
+       : (shellDialect === 'pwsh' ? DEFAULT_PWSH_ARGS : DEFAULT_BASH_ARGS),
+@@ -120,6 +150,31 @@ export function validateConfig(config: Config): asserts config is ResolvedConfig
+   const resolved = config as ResolvedConfig
+   if (resolved.backendType.length === 0) throw new Error('terminal-bash: backendType must be non-empty')
+   if (resolved.shellPath.length === 0) throw new Error('terminal-bash: shellPath must be non-empty')
++  // FreeBSD does not ship bash by default (its base shell is /bin/sh, an ash
++  // derivative). This backend requires bash: `PROMPT_COMMAND` (set in
++  // index.ts `childEnvironment`) drives the per-prompt OSC 133;D; marker the
++  // sanitizer relies on, and the default `shellArgs` (`--noprofile --norc -i`)
++  // are bash-only flags. Fail here with install guidance rather than with a
++  // cryptic "PTY shell exited during startup" at PTY spawn time.
++  if (process.platform === 'freebsd') {
++    if (!existsSync(resolved.shellPath)) {
++      throw new Error(
++        `terminal-bash: the configured shell "${resolved.shellPath}" does not exist. ` +
++          'FreeBSD does not include bash in a default install. Install it first, e.g. ' +
++          '`pkg install bash` (or from ports: `cd /usr/ports/shells/bash && make install clean`). ' +
++          'If bash is installed at a non-standard path, set terminal-bash.shellPath to its absolute path.',
++      )
++    }
++    const shellBase = resolved.shellPath.split('/').pop() ?? ''
++    if (shellBase !== 'bash' && !shellBase.endsWith('bash')) {
++      throw new Error(
++        `terminal-bash: "${resolved.shellPath}" does not look like bash. ` +
++          'The terminal-bash backend requires bash (it uses PROMPT_COMMAND and the ' +
++          '--noprofile/--norc flags); the FreeBSD default /bin/sh (ash) is not supported. ' +
++          'Install bash and point terminal-bash.shellPath at it.',
++      )
++    }
++  }
+   for (const [name, value] of Object.entries(resolved)) {
+     if (name === 'promptTailGraceMs') continue
+     if (typeof value === 'number' && (!Number.isSafeInteger(value) || value <= 0)) {
+diff --git a/packages/util/native-command/src/path-opener.ts b/packages/util/native-command/src/path-opener.ts
+index abd9bcba42..1dc09fbdaf 100644
+--- a/packages/util/native-command/src/path-opener.ts
++++ b/packages/util/native-command/src/path-opener.ts
+@@ -191,6 +191,13 @@ async function openNativePathWithIntent(
+     return
+   }
+ 
++  if (platform === 'freebsd') {
++    // FreeBSD has no platform-specific opener; xdg-open (from xdg-utils) reaches
++    // the desktop when one is installed, exactly as on Linux.
++    await run('xdg-open', [path], signal, 'hidden')
++    return
++  }
++
+   throw new Error(`native path opener is unsupported on ${platform}`)
+ }
+ 
+@@ -208,7 +215,9 @@ async function openNativePathWithIntent(
+ export function canOpenNativePath(internals: PathOpenerInternals = {}): boolean {
+   const platform = internals.platform ?? process.platform
+   if (platform === 'darwin' || platform === 'win32') return true
+-  if (platform !== 'linux') return false
++  // Linux and FreeBSD reach a desktop only through a display server; WSL
++  // (Linux only) instead reaches the Windows desktop.
++  if (platform !== 'linux' && platform !== 'freebsd') return false
+   const env = internals.env ?? process.env
+   return isWsl(internals) || present(env.DISPLAY) || present(env.WAYLAND_DISPLAY)
+ }
+@@ -268,7 +277,7 @@ export function nativeFileManager(internals: PathOpenerInternals = {}): NativeFi
+   const platform = internals.platform ?? process.platform
+   if (platform === 'darwin') return 'finder'
+   if (platform === 'win32' || (platform === 'linux' && isWsl(internals))) return 'explorer'
+-  return platform === 'linux' ? 'directory' : null
++  return (platform === 'linux' || platform === 'freebsd') ? 'directory' : null
+ }
+ 
+ /**
+diff --git a/packages/util/native-command/tests/path-opener.spec.ts b/packages/util/native-command/tests/path-opener.spec.ts
+index 2ee85acc9b..855720ef1c 100644
+--- a/packages/util/native-command/tests/path-opener.spec.ts
++++ b/packages/util/native-command/tests/path-opener.spec.ts
+@@ -157,9 +157,21 @@ describe('native path opener', () => {
+     expect(run).toHaveBeenCalledWith('xdg-open', ['/tmp/a.txt'], expect.any(AbortSignal), 'hidden')
+   })
+ 
+-  it('rejects unsupported platforms', async () => {
+-    await expect(openNativePath('/x', signal(), { platform: 'freebsd' as NodeJS.Platform }))
+-      .rejects.toThrow('unsupported on freebsd')
++  it('opens with FreeBSD xdg-open', async () => {
++    const run = vi.fn<PathOpenerRunner>(async () => ({ stdout: '', stderr: '' }))
++    await openNativePath('/tmp/settings.yaml', signal(), { platform: 'freebsd', env: {}, run })
++    expect(run).toHaveBeenCalledWith('xdg-open', ['/tmp/settings.yaml'], expect.any(AbortSignal))
++  })
++
++  it('opens a text document with FreeBSD xdg-open', async () => {
++    const run = vi.fn<PathOpenerRunner>(async () => ({ stdout: '', stderr: '' }))
++    await openNativeTextFile('/tmp/settings.yaml', signal(), { platform: 'freebsd', env: {}, run })
++    expect(run).toHaveBeenCalledWith('xdg-open', ['/tmp/settings.yaml'], expect.any(AbortSignal))
++  })
++
++  it('rejects other unsupported platforms', async () => {
++    await expect(openNativePath('/x', signal(), { platform: 'sunos' as NodeJS.Platform }))
++      .rejects.toThrow('unsupported on sunos')
+   })
+ 
+   it('uses the current process platform when no platform override is supplied', async () => {
+@@ -169,7 +181,7 @@ describe('native path opener', () => {
+     })
+     const expected = process.platform === 'win32'
+       ? 'explorer.exe'
+-      : process.platform === 'linux'
++      : process.platform === 'linux' || process.platform === 'freebsd'
+         ? 'xdg-open'
+         : 'open'
+     expect(run.mock.calls[0]?.[0]).toBe(expected)
+@@ -380,6 +392,7 @@ describe('native file manager', () => {
+     ['darwin', 'finder', '/tmp/my report.txt', 'open', ['-R', '/tmp/my report.txt']],
+     ['win32', 'explorer', 'C:\\work\\my report.txt', 'explorer.exe', ['/select,', 'file:///C:/work/my%20report.txt']],
+     ['linux', 'directory', '/tmp/a $b; report.txt', 'xdg-open', ['/tmp']],
++    ['freebsd', 'directory', '/tmp/a $b; report.txt', 'xdg-open', ['/tmp']],
+   ] as const)('reveals through %s without opening the file association', async (platform, manager, path, command, args) => {
+     const run = vi.fn<PathOpenerRunner>(async () => ({ stdout: '', stderr: '' }))
+     const internals = { platform, env: {}, osRelease: 'generic', run }
+diff --git a/packages/util/ripgrep/src/index.ts b/packages/util/ripgrep/src/index.ts
+index e9ca71e636..e37f2b4211 100644
+--- a/packages/util/ripgrep/src/index.ts
++++ b/packages/util/ripgrep/src/index.ts
+@@ -1,29 +1,78 @@
+ /** Packaged ripgrep resolution and subprocess execution, independent of tool or Remote consumers. */
+ import { existsSync } from 'node:fs'
++import { execSync } from 'node:child_process'
+ import { join, parse } from 'node:path'
+ import type { SubprocessHandle, SubprocessOutcome, SubprocessRuntime, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+ 
+-let rgPathPromise: Promise<string> | undefined
+-
+ /**
+- * Resolve the packaged executable lazily, once per process. Single-file runtimes use an existing
+- * `-rg` sidecar; Electron uses the unpacked ASAR path. Resolution failures reject
+- * this call, not package loading. No system executable or remote fallback is used.
+- * @returns the packaged executable's absolute path.
++ * The ripgrep binary path, resolved at each call (not memoized) so that a
++ * system `rg` installed after the process started is picked up on the very
++ * next search without having to restart the harness.
++ *
++ * A single-file runtime uses the executable's `-rg` sidecar because a native
++ * helper cannot be spawned from pkg's virtual filesystem. Node-mode builds
++ * fall back to the platform package selected by `@vscode/ripgrep`. Resolving
++ * at the call boundary keeps a missing or corrupt binary at the first search
++ * call as `SEARCH_FAILED`, rather than failing the Loader composition.
++ *
++ * FORK NOTE (FreeBSD port): upstream resolves lazily once per process and uses
++ * no system fallback. Here `@vscode/ripgrep` ships no `freebsd-x64` package and
++ * THROWS at import, so resolution order is:
++ *   1. `DSH_RIPGREP_PATH` env override (explicit, e.g. a system ripgrep);
++ *   2. a single-file runtime's `-rg` sidecar beside the executable;
++ *   3. the packaged `@vscode/ripgrep` binary, only when the file exists;
++ *   4. a system `rg` discovered on `PATH` (`pkg install ripgrep` on FreeBSD);
++ *   5. the packaged path even if missing — lets spawn surface `SEARCH_FAILED`
++ *      as before when nothing usable is available.
++ *
++ * Deliberately NOT memoized (upstream memoizes the first resolution): on FreeBSD
++ * the usable binary is whatever `rg` the operator installed — `pkg install
++ * ripgrep` is then picked up by the very next search, no harness restart.
++ *
++ * @returns the chosen binary's absolute path; the promise rejects when no
++ *   platform package can be resolved and none of the fallbacks exist.
+  */
+ export function resolveRgPath(): Promise<string> {
+-  rgPathPromise ??= Promise.resolve().then(async () => {
+-    const executable = parse(process.execPath)
+-    const executableSidecar = process.platform === 'win32'
+-      ? join(executable.dir, `${executable.name}-rg.exe`)
+-      : `${process.execPath}-rg`
+-    if ('pkg' in process && existsSync(executableSidecar)) return executableSidecar
+-    const dependency = (await import('@vscode/ripgrep')).rgPath
+-    return process.versions.electron === undefined
+-      ? dependency
+-      : dependency.replace(/\.asar(?=[\\/])/u, '.asar.unpacked')
+-  })
+-  return rgPathPromise
++  return resolveRgPathUncached()
++}
++
++/**
++ * Resolve the usable binary for this call. Checks the env override and single-
++ * file sidecar first, then the packaged path, then a system `rg` (FreeBSD), and
++ * finally the packaged path even if missing so spawn can surface SEARCH_FAILED.
++ */
++async function resolveRgPathUncached(): Promise<string> {
++  const override = process.env.DSH_RIPGREP_PATH
++  if (override !== undefined && existsSync(override)) return override
++  const executable = parse(process.execPath)
++  const executableSidecar = process.platform === 'win32'
++    ? join(executable.dir, `${executable.name}-rg.exe`)
++    : `${process.execPath}-rg`
++  if ('pkg' in process && existsSync(executableSidecar)) return executableSidecar
++  let packaged: string | undefined
++  try {
++    packaged = await resolvePackagedRgPath()
++  } catch {
++    // No platform package for this platform (FreeBSD ships none) — fall through
++    // to a system binary.
++  }
++  if (packaged !== undefined && existsSync(packaged)) return packaged
++  try {
++    const onPath = execSync('command -v rg', { encoding: 'utf-8' }).trim()
++    if (onPath.length > 0) return onPath
++  } catch {
++    // No system rg on PATH.
++  }
++  if (packaged !== undefined) return packaged
++  return resolvePackagedRgPath()
++}
++
++/** The `@vscode/ripgrep` platform binary, with upstream's Electron asar rewrite. */
++async function resolvePackagedRgPath(): Promise<string> {
++  const dependency = (await import('@vscode/ripgrep')).rgPath
++  return process.versions.electron === undefined
++    ? dependency
++    : dependency.replace(/\.asar(?=[\\/])/u, '.asar.unpacked')
+ }
+ 
+ /**
+diff --git a/packages/util/ripgrep/tests/path.spec.ts b/packages/util/ripgrep/tests/path.spec.ts
+index 37eeba956c..5f17fa7899 100644
+--- a/packages/util/ripgrep/tests/path.spec.ts
++++ b/packages/util/ripgrep/tests/path.spec.ts
+@@ -1,12 +1,27 @@
+ import { join, parse } from 'node:path'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++/**
++ * Packaged-ripgrep resolution order: the pkg sidecar beside the executable, the
++ * Electron ASAR rewrite, and the plain dependency path in an ordinary Node
++ * process.
++ *
++ * FORK NOTE (FreeBSD port): `resolveRgPath` also falls back to a system `rg`
++ * found on `PATH`, because `@vscode/ripgrep` ships no FreeBSD binary and
++ * `pkg install ripgrep` is the only usable source. That fallback sits AFTER the
++ * packaged path, so it only takes over when the packaged path does not exist —
++ * but it means these tests must hide `PATH`, or a host that happens to have
++ * ripgrep installed resolves to `/usr/local/bin/rg` and the packaged-path
++ * assertions never see the dependency.
++ */
++
+ const { dependency, existsSync } = vi.hoisted(() => ({
+   dependency: { rgPath: '/node_modules/@vscode/ripgrep/bin/rg' },
+   existsSync: vi.fn(),
+ }))
+ const originalPlatform = process.platform
+ const originalExecPath = process.execPath
++const originalRipgrepOverride = process.env.DSH_RIPGREP_PATH
+ 
+ vi.mock('node:fs', async (importOriginal) => {
+   const actual = await importOriginal<typeof import('node:fs')>()
+@@ -23,9 +38,18 @@ beforeEach(() => {
+   Reflect.deleteProperty(process.versions, 'electron')
+   Reflect.defineProperty(process, 'platform', { configurable: true, enumerable: true, value: originalPlatform })
+   process.execPath = originalExecPath
++  // Remove every non-packaged candidate (see FORK NOTE above): the env override
++  // and the system `rg` on PATH. The override must be ABSENT, not `''` — its
++  // guard is `override !== undefined && existsSync(override)`, and this file
++  // mocks existsSync, so an empty string would be accepted as a real override.
++  vi.stubEnv('PATH', '/nonexistent-dsh-ripgrep-test')
++  delete process.env.DSH_RIPGREP_PATH
+ })
+ 
+ afterEach(() => {
++  vi.unstubAllEnvs()
++  if (originalRipgrepOverride === undefined) delete process.env.DSH_RIPGREP_PATH
++  else process.env.DSH_RIPGREP_PATH = originalRipgrepOverride
+   Reflect.deleteProperty(process, 'pkg')
+   Reflect.deleteProperty(process.versions, 'electron')
+   Reflect.defineProperty(process, 'platform', { configurable: true, enumerable: true, value: originalPlatform })
+@@ -62,7 +86,10 @@ describe('ripgrep resolution', () => {
+     const { resolveRgPath } = await import('@deepseek-ai/dsh-util-ripgrep')
+ 
+     await expect(resolveRgPath()).resolves.toBe(dependency.rgPath)
+-    expect(existsSync).not.toHaveBeenCalled()
++    // FORK NOTE: upstream forbade any probe here; the fork deliberately checks
++    // the packaged path before trusting it, so a missing FreeBSD platform
++    // package falls through to the system rg instead of returning a dead path.
++    expect(existsSync).toHaveBeenCalledWith(dependency.rgPath)
+   })
+ 
+   it('uses the dependency binary when a packaged runtime has no sidecar', async () => {
+diff --git a/scripts/gen-config-catalog.ts b/scripts/gen-config-catalog.ts
+index a736066912..b95acd8ffc 100644
+--- a/scripts/gen-config-catalog.ts
++++ b/scripts/gen-config-catalog.ts
+@@ -1114,7 +1114,7 @@ function main(): void {
+     console.error(`gen-config-catalog: stale — ${stale.join(', ')}. Run \`pnpm run gen-config-catalog\` and commit the result.`)
+     process.exit(1)
+   }
+-  for (const path of stale) writeFileSync(resolve(root, path), outputs.get(path) ?? '')
++  for (const path of stale) writeFileSync(resolve(root, path), (outputs.get(path) ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+   console.log(`gen-config-catalog: ${outputs.size} artifact(s) computed, ${stale.length} written.`)
+ }
+ 
+diff --git a/scripts/gen-cordis-catalog.ts b/scripts/gen-cordis-catalog.ts
+index 92ae05967e..45677c6123 100644
+--- a/scripts/gen-cordis-catalog.ts
++++ b/scripts/gen-cordis-catalog.ts
+@@ -1471,7 +1471,7 @@ export function main(): void {
+     const destination = resolve(root, out)
+     if (existsSync(destination) && readFileSync(destination, 'utf8') === content) continue
+     mkdirSync(dirname(destination), { recursive: true })
+-    writeFileSync(destination, content)
++    writeFileSync(destination, content.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+     changedPages++
+   }
+   console.log(`gen-cordis-catalog: ${outputs.length} artifact(s) computed, ${changedPages} written.`)
+diff --git a/vendor/README.md b/vendor/README.md
+index c3a4c8e774..bdac127a76 100644
+--- a/vendor/README.md
++++ b/vendor/README.md
+@@ -55,6 +55,7 @@ Relative to the resolver source in Cordis `v4.0.0-rc.11`:
+ 
+ - **Web build imports:** `loader/src/resolve.ts` uses default imports for Node builtin modules to support the Web shell's browser externalization. The shell supplies its own module loader.
+ - **Package-scope cache keys:** `loader/src/resolve.ts` normalizes directory paths with `path.resolve()` before finding the package scope. A root config and a nested config in the same package therefore share the same cached resolver promise and helper-file write. Covered by `scripts/cordis-loader-resolve.spec.ts`.
++- **`loader/src/internal.ts` FreeBSD native-addon guard**: `requireInternal` returns the JS internal module via `require(id)` (or `undefined` when no `--expose-internals` flag is present) when `process.platform === 'freebsd'`, instead of requiring the native `node-addon-require-builtin` addon. FreeBSD has no prebuilt `.node` and the addon's runtime probing fails closed; this removes the `noUsableBindingError` crash-loop that occurred during `service dsh_web restart` when the first boot attempt had not yet loaded `--expose-internals`. Covered by the 0.88 `service dsh_web restart` smoke (two consecutive clean restarts, zero `noUsableBindingError` in the new log segment).
+ 
+ ## Sync procedure
+ 
+diff --git a/vendor/loader/src/internal.ts b/vendor/loader/src/internal.ts
+index 322fbceb6a..1d3139ba72 100644
+--- a/vendor/loader/src/internal.ts
++++ b/vendor/loader/src/internal.ts
+@@ -105,13 +105,15 @@ export type ModuleLoader = ModuleLoaderV1 | ModuleLoaderV2
+ export namespace ModuleLoader {
+   let _cachedLoader: ModuleLoader | undefined
+ 
++  // FreeBSD has no prebuilt node-addon-require-builtin; rely on the --expose-internals JS path.
+   function requireInternal(id: string): any {
+     const require = createRequire(import.meta.url)
+-    if (process.execArgv.includes('--expose-internals')) {
++    if (process.platform === 'freebsd' || process.execArgv.includes('--expose-internals')) {
+       try {
+         return require(id)
+       } catch {}
+     }
++    if (process.platform === 'freebsd') return undefined
+     try {
+       return require('node-addon-require-builtin').requireBuiltin(id)
+     } catch {}

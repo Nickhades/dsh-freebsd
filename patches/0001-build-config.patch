@@ -1,0 +1,185 @@
+diff --git a/.gitignore b/.gitignore
+index 6255c7081b..fe0bfddd94 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -52,3 +52,8 @@ native/system/test/bin/
+ 
+ # Generated company-signed CUA release record.
+ /packages/experimental/cua-macos/cua-helper.json
++
++# dsh web service runtime state (rc.d writes these next to the repo when
++# dsh_web_chdir points at the checkout; see freebsd/dsh_web.rcd)
++dsh_web.log
++dsh_web.pid
+diff --git a/package.json b/package.json
+index d5c9d2c449..6607265de3 100644
+--- a/package.json
++++ b/package.json
+@@ -25,7 +25,7 @@
+     "build:official": "tsx scripts/build.ts --profile official",
+     "build:lib": "pnpm run build:lib:host && pnpm run build:lib:client",
+     "build:lib:host": "tsx scripts/compile-referenced-projects.ts host-libraries && node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc -p tsconfig.host.json && pnpm --filter @deepseek-ai/dsh-desktop run bundle",
+-    "build:lib:client": "tsc -b tsconfig.client.json && tsdown --config-loader native --env.DSH_BUILD_FACE client",
++    "build:lib:client": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc -b tsconfig.client.json && NODE_OPTIONS=--max-old-space-size=8192 tsdown --config-loader native --env.DSH_BUILD_FACE client",
+     "build:web": "pnpm --filter @deepseek-ai/dsh-web-frontend run build",
+     "build:desktop": "pnpm --filter @deepseek-ai/dsh-desktop run build",
+     "dev:desktop": "pnpm --filter @deepseek-ai/dsh-desktop run dev",
+@@ -210,6 +210,10 @@
+     "release:verify-packed-install": "tsx scripts/release/verify-packed-install.ts",
+     "release:publish": "tsx scripts/release/publish.ts",
+     "dsh": "node --import tsx/esm apps/cli/src/bin.ts",
++    "dsh:freebsd": "node --expose-internals --import tsx/esm apps/cli/src/bin.ts",
++    "demo:code-mode": "node scripts/demo-code-mode.mjs",
++    "demo:cordis": "node scripts/demo-cordis.mjs",
++    "demo:acp": "node --import tsx packages/examples/acp-demo/src/bin.ts --config examples/acp-agent/cordis.yml",
+     "demo:ptc": "node scripts/demo-ptc.mjs",
+     "demo:inspector": "node --import tsx/esm apps/cli/src/bin.ts web --patch ./packages/experimental/inspector/cordis.source.patch.yml",
+     "mock:llm": "node --import tsx packages/test-support/llm-mock-server/src/bin.ts",
+diff --git a/patches/node-pty@1.2.0-beta.15.patch b/patches/node-pty@1.2.0-beta.15.patch
+index 68e7f032cb..46330af80e 100644
+--- a/patches/node-pty@1.2.0-beta.15.patch
++++ b/patches/node-pty@1.2.0-beta.15.patch
+@@ -43,3 +43,31 @@ index 90ffd8fb69764052b0714cfb2b1213c073603c28..399861d7bbd0fb733fa032e923efa8b6
+              this._outSocket.on('data', function () {
+                  _this._conoutSocketWorker.dispose();
+              });
++diff --git a/src/unix/pty.cc b/src/unix/pty.cc
++index 3b7d3dc..3c77c57 100644
++--- a/src/unix/pty.cc
+++++ b/src/unix/pty.cc
++@@ -112,7 +112,7 @@ struct ExitEvent {
++   int exit_code = 0, signal_code = 0;
++ };
++ 
++-#if defined(__linux__)
+++#if defined(__linux__) || defined(__FreeBSD__)
++ 
++ static int
++ SetCloseOnExec(int fd) {
++@@ -130,12 +130,14 @@ SetCloseOnExec(int fd) {
++  */
++ static void
++ pty_close_inherited_fds() {
+++#if defined(__linux__)
++   // Try close_range() first (Linux 5.9+, glibc 2.34+)
++   #if defined(SYS_close_range) && defined(CLOSE_RANGE_CLOEXEC)
++   if (syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
++     return;
++   }
++   #endif
+++#endif
++ 
++   int fd;
++   // Set the CLOEXEC flag on all open descriptors. Unconditionally try the first
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 9a84d64b21..c32bafc4b9 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -9,6 +9,8 @@ overrides:
+   '@deepseek-ai/cosmokit': link:vendor/cosmokit
+   '@deepseek-ai/schemastery': link:vendor/schemastery
+ 
++packageExtensionsChecksum: sha256-wL7od7DfVQFCPGuFgQYh2UHvX0MTwc+D6rrFPusxsRk=
++
+ patchedDependencies:
+   '@botiverse/oar@0.67.0': 65de2ca1966421e30893d8d4fed6a3d88e4247e131e7575fe791246e594538d6
+   '@earendil-works/pi-ai@1.3.0': 4e1c90fd00aea42989664504668633033c1962e53c07860901edb4f72d843765
+@@ -21,7 +23,7 @@ patchedDependencies:
+   lexical@0.49.0: 54c4413db208cf234cb68c6a837f2523d3b319aa17911f1da385af08362e1356
+   mdast-util-gfm-autolink-literal@2.0.1: 7fa6fc7927128a45c3f148d31faf388806895e2de39c14a144200edbc1e7aaa0
+   micromark-extension-gfm-autolink-literal@2.1.0: 906ae7c0cd1f69e7ee308a41bc0542e0085276ac7517e56e96f0ccaf5a89327d
+-  node-pty@1.2.0-beta.15: 9d30053266d0f39d3debe894c675867f6782da6bcadbc94a693b3cfb9eff8ed0
++  node-pty@1.2.0-beta.15: 6c53eae8936f164a5a802a4b9c49717b28d60c10fbed217e7363bfcef47f2a1d
+ 
+ importers:
+ 
+@@ -1239,6 +1241,9 @@ importers:
+       '@deepseek-ai/node-addon-system-darwin-x64':
+         specifier: workspace:~
+         version: link:../darwin-x64
++      '@deepseek-ai/node-addon-system-freebsd-x64':
++        specifier: workspace:~
++        version: link:../freebsd-x64
+       '@deepseek-ai/node-addon-system-linux-arm64':
+         specifier: workspace:~
+         version: link:../linux-arm64
+@@ -1246,6 +1251,8 @@ importers:
+         specifier: workspace:~
+         version: link:../linux-x64
+ 
++  native/system/packages/freebsd-x64: {}
++
+   native/system/packages/linux-arm64: {}
+ 
+   native/system/packages/linux-x64: {}
+@@ -17197,7 +17204,7 @@ importers:
+         version: 3.1.1
+       node-pty:
+         specifier: 1.2.0-beta.15
+-        version: 1.2.0-beta.15(patch_hash=9d30053266d0f39d3debe894c675867f6782da6bcadbc94a693b3cfb9eff8ed0)
++        version: 1.2.0-beta.15(patch_hash=6c53eae8936f164a5a802a4b9c49717b28d60c10fbed217e7363bfcef47f2a1d)
+     devDependencies:
+       '@deepseek-ai/cordis':
+         specifier: workspace:~
+@@ -33079,7 +33086,7 @@ snapshots:
+ 
+   node-int64@0.4.0: {}
+ 
+-  node-pty@1.2.0-beta.15(patch_hash=9d30053266d0f39d3debe894c675867f6782da6bcadbc94a693b3cfb9eff8ed0):
++  node-pty@1.2.0-beta.15(patch_hash=6c53eae8936f164a5a802a4b9c49717b28d60c10fbed217e7363bfcef47f2a1d):
+     dependencies:
+       node-addon-api: 7.1.1
+ 
+@@ -33860,6 +33867,7 @@ snapshots:
+       '@img/sharp-linux-x64': 0.35.5
+       '@img/sharp-linuxmusl-arm64': 0.35.5
+       '@img/sharp-linuxmusl-x64': 0.35.5
++      '@img/sharp-wasm32': 0.35.5
+       '@img/sharp-webcontainers-wasm32': 0.35.5
+       '@img/sharp-win32-arm64': 0.35.5
+       '@img/sharp-win32-ia32': 0.35.5
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index 02bb4f0fb5..980e578e09 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -122,3 +122,40 @@ patchedDependencies:
+   mdast-util-gfm-autolink-literal@2.0.1: patches/mdast-util-gfm-autolink-literal@2.0.1.patch
+   micromark-extension-gfm-autolink-literal@2.1.0: patches/micromark-extension-gfm-autolink-literal@2.1.0.patch
+   node-pty@1.2.0-beta.15: patches/node-pty@1.2.0-beta.15.patch
++
++# --- Cross-platform native binary support (FreeBSD port + CI + dev machines) ---
++# pnpm v11 reads these from pnpm-workspace.yaml, NOT package.json's `pnpm` field.
++# - `freebsd` + `wasm32`: force-install sharp's FreeBSD/WASM runtime. sharp ships
++#   NO native freebsd-x64 binary, so the wasm fallback
++#   (@img/sharp-freebsd-wasm32 -> @img/sharp-wasm32) is the only working image
++#   backend on FreeBSD.
++# - `linux`/`darwin`/`win32` + `arm64` + `libc: [glibc, musl]`: REQUIRED so that
++#   `pnpm install` on non-FreeBSD hosts (GitHub linux-x64 CI runner, macOS/Windows
++#   dev machines) actually fetches the platform-native optional binaries
++#   (lightningcss-linux-x64-gnu, @esbuild/linux-x64, rollup-linux-x64-gnu, ...).
++#   Without these, tsdown/esbuild fail at runtime with
++#   "Cannot find module '...linux-x64-gnu.node'".
++# NOTE: `libc` MUST be `glibc`/`musl` — the formerly-used `any` is NOT a valid
++# value and silently filters out every glibc/musl-native optional dependency.
++# `os`/`cpu` are additive to the *current* platform, so listing freebsd here does
++# NOT drop the host's own binaries; it only broadens which optional deps are kept.
++# pnpm downloads optional platform binaries for EVERY listed platform (union
++# semantics); the default is the current host only. Non-FreeBSD hosts (GitHub
++# CI linux-x64, macOS/Windows dev machines) match their own host natively, so
++# they need NO entry here. Only FreeBSD + the sharp WASM fallback (cpu axis)
++# are declared.
++supportedArchitectures:
++  os:
++    - freebsd
++  cpu:
++    - x64
++    - wasm32
++# Hoist every workspace + dependency package into the top-level node_modules so
++# the runtime loader's dynamic import('@deepseek-ai/dsh-client-ui-*') resolves.
++shamefullyHoist: true
++# Belt-and-suspenders: make sharp explicitly declare its FreeBSD/WASM runtimes.
++packageExtensions:
++  'sharp@*':
++    optionalDependencies:
++      '@img/sharp-freebsd-wasm32': '*'
++      '@img/sharp-wasm32': '*'

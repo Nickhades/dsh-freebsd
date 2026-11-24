@@ -1,0 +1,314 @@
+diff --git a/native/system/packages/entry/package.json b/native/system/packages/entry/package.json
+index 24c5992fdc..be9c018bcb 100644
+--- a/native/system/packages/entry/package.json
++++ b/native/system/packages/entry/package.json
+@@ -40,6 +40,7 @@
+   "optionalDependencies": {
+     "@deepseek-ai/node-addon-system-darwin-arm64": "workspace:~",
+     "@deepseek-ai/node-addon-system-darwin-x64": "workspace:~",
++    "@deepseek-ai/node-addon-system-freebsd-x64": "workspace:~",
+     "@deepseek-ai/node-addon-system-linux-arm64": "workspace:~",
+     "@deepseek-ai/node-addon-system-linux-x64": "workspace:~"
+   }
+diff --git a/native/system/packages/entry/src/flock.ts b/native/system/packages/entry/src/flock.ts
+index fcbf8a9e3c..ffdfab265c 100644
+--- a/native/system/packages/entry/src/flock.ts
++++ b/native/system/packages/entry/src/flock.ts
+@@ -12,7 +12,10 @@ let binding: FlockBinding | undefined
+ function loadBinding(): FlockBinding {
+   if (binding) return binding
+   const { platform, arch } = process
+-  if (platform !== 'linux' && platform !== 'darwin') {
++  // FreeBSD is a first-class POSIX target of this fork: it ships flock(2) and
++  // builds the same Node-API addon (native/system/scripts/build.ts). It uses
++  // the flat bin/system.node layout, so only Linux selects a libc subdirectory.
++  if (platform !== 'linux' && platform !== 'darwin' && platform !== 'freebsd') {
+     throw Object.assign(new Error(`flock is not supported on ${platform}-${arch}`), {
+       code: 'ERR_FLOCK_UNSUPPORTED_PLATFORM',
+       syscall: 'flock',
+diff --git a/native/system/packages/freebsd-x64/LICENSE b/native/system/packages/freebsd-x64/LICENSE
+new file mode 100644
+index 0000000000..8187059c9a
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/LICENSE
+@@ -0,0 +1,28 @@
++BSD 3-Clause License
++
++Copyright (c) 2026, node-addon-landlock-run contributors
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its
++   contributors may be used to endorse or promote products derived from
++   this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+diff --git a/native/system/packages/freebsd-x64/README.i18n.yaml b/native/system/packages/freebsd-x64/README.i18n.yaml
+new file mode 100644
+index 0000000000..9d4ef6722a
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/README.i18n.yaml
+@@ -0,0 +1,10 @@
++# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
++# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
++# After editing either side, bring the other along and re-record with:
++#   pnpm run verify-translation-pairing --write native/system/packages/freebsd-x64/README.md
++/:
++  en: beff97124d989819
++  zh: 8cdceb79b0f1252b
++/deepseek-ai-node-addon-system-freebsd-x64:
++  en: 898d364155c25d52
++  zh: a14a7506384526f3
+diff --git a/native/system/packages/freebsd-x64/README.md b/native/system/packages/freebsd-x64/README.md
+new file mode 100644
+index 0000000000..c7e869e57c
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/README.md
+@@ -0,0 +1,9 @@
++---
++description: "Prebuilt system.node for FreeBSD x64 POSIX locks."
++kind: "package-library"
++---
++# @deepseek-ai/node-addon-system-freebsd-x64
++
++English | [中文](README.zh.md)
++
++This platform package supplies `bin/system.node`, a stable Node-API v8 addon used by `@deepseek-ai/node-addon-system/flock`. It contains no Landlock executable, JavaScript loader, or installation build script. `pnpm run build:native-system` builds it on FreeBSD x64 from the shared `flock.c` source, and the FreeBSD port owns its installed-artifact validation.
+diff --git a/native/system/packages/freebsd-x64/README.zh.md b/native/system/packages/freebsd-x64/README.zh.md
+new file mode 100644
+index 0000000000..efe244b479
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/README.zh.md
+@@ -0,0 +1,9 @@
++---
++description: "为 FreeBSD x64 POSIX 锁提供预编译 system.node。"
++kind: "package-library"
++---
++# @deepseek-ai/node-addon-system-freebsd-x64
++
++[English](README.md) | 中文
++
++此平台包提供 `bin/system.node`，供 `@deepseek-ai/node-addon-system/flock` 使用的稳定 Node-API v8 addon。它不包含 Landlock 可执行文件、JavaScript 加载器或安装构建脚本。`pnpm run build:native-system` 在 FreeBSD x64 上从共用的 `flock.c` 源码构建它，并由 FreeBSD 移植负责验证安装后的产物。
+diff --git a/native/system/packages/freebsd-x64/package.json b/native/system/packages/freebsd-x64/package.json
+new file mode 100644
+index 0000000000..ec0e54a420
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/package.json
+@@ -0,0 +1,31 @@
++{
++  "name": "@deepseek-ai/node-addon-system-freebsd-x64",
++  "version": "0.1.2",
++  "description": "Prebuilt POSIX flock Node-API binding for FreeBSD x64",
++  "repository": {
++    "type": "git",
++    "url": "git+https://github.com/deepseek-harness/deepseek-harness.git",
++    "directory": "native/system/packages/freebsd-x64"
++  },
++  "os": [
++    "freebsd"
++  ],
++  "cpu": [
++    "x64"
++  ],
++  "files": [
++    "README.md",
++    "bin/",
++    "prebuilds.json"
++  ],
++  "scripts": {
++    "prepack": "node ../../scripts/verify-launcher-binary.mjs"
++  },
++  "engines": {
++    "node": ">=20"
++  },
++  "license": "BSD-3-Clause",
++  "publishConfig": {
++    "access": "public"
++  }
++}
+diff --git a/native/system/packages/freebsd-x64/prebuilds.json b/native/system/packages/freebsd-x64/prebuilds.json
+new file mode 100644
+index 0000000000..f212037476
+--- /dev/null
++++ b/native/system/packages/freebsd-x64/prebuilds.json
+@@ -0,0 +1,6 @@
++{
++  "platform": "freebsd-x64",
++  "binaries": [
++    { "tool": "flock", "kind": "node-api", "napi": 8, "path": "bin/system.node" }
++  ]
++}
+diff --git a/native/system/scripts/build-test-oracle.mjs b/native/system/scripts/build-test-oracle.mjs
+index 22f6bf9f4b..65731de38a 100644
+--- a/native/system/scripts/build-test-oracle.mjs
++++ b/native/system/scripts/build-test-oracle.mjs
+@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
+ import { spawnSync } from 'node:child_process';
+ 
+ const root = fileURLToPath(new URL('..', import.meta.url));
+-if (process.platform !== 'linux' && process.platform !== 'darwin') {
++if (process.platform !== 'linux' && process.platform !== 'darwin' && process.platform !== 'freebsd') {
+   throw new Error('The flock oracle is a POSIX test fixture');
+ }
+ const variants = process.platform === 'linux' ? ['glibc', 'musl'] : [''];
+diff --git a/native/system/scripts/build.ts b/native/system/scripts/build.ts
+index ca995d9c03..e0a1ec775f 100644
+--- a/native/system/scripts/build.ts
++++ b/native/system/scripts/build.ts
+@@ -1,6 +1,9 @@
+ /**
+  * Build this host's declared system binaries. Landlock is a static musl
+  * executable; flock uses stable Node-API with separate Linux libc builds.
++ * FreeBSD builds the flock addon from the same source with `cc -shared`
++ * (it has flock(2) and no Landlock), using the headers shipped with the
++ * Node installation.
+  * Node headers come from the Node installation running this script.
+  */
+ import { spawnSync } from 'node:child_process'
+@@ -24,9 +27,9 @@ interface Binary {
+   libc?: string
+ }
+ 
+-if (process.platform !== 'linux' && process.platform !== 'darwin') {
++if (process.platform !== 'linux' && process.platform !== 'darwin' && process.platform !== 'freebsd') {
+   if (hostAddonOnly) process.exit(0)
+-  throw new Error('build: system binaries are built on Linux or macOS; no native target for this host')
++  throw new Error('build: system binaries are built on Linux, macOS, or FreeBSD; no native target for this host')
+ }
+ const host = `${process.platform}-${process.arch}`
+ const libc = process.platform === 'linux'
+@@ -64,7 +67,7 @@ for (const name of readdirSync(join(root, 'packages')).sort()) {
+         if (binary.libc !== undefined) throw new Error('build: macOS flock does not select a Linux libc')
+         flags.push('-bundle', '-undefined', 'dynamic_lookup', '-mmacosx-version-min=11.0')
+       } else {
+-        if (binary.libc !== 'glibc' && binary.libc !== 'musl') {
++        if (process.platform === 'linux' && binary.libc !== 'glibc' && binary.libc !== 'musl') {
+           throw new Error('build: Linux flock must select glibc or musl')
+         }
+         flags.push('-shared')
+diff --git a/native/system/scripts/repo.mjs b/native/system/scripts/repo.mjs
+index ceb1de6f1d..7cf17eec8c 100644
+--- a/native/system/scripts/repo.mjs
++++ b/native/system/scripts/repo.mjs
+@@ -52,7 +52,7 @@ export function verifyPlatformBinaries(packageDir) {
+   const prebuilds = readJson(path.join(packageDir, 'prebuilds.json'));
+   const cpu = manifest.cpu?.[0];
+   const os = manifest.os?.[0];
+-  if (!(cpu in E_MACHINE) || !['linux', 'darwin'].includes(os)) {
++  if (!(cpu in E_MACHINE) || !['linux', 'darwin', 'freebsd'].includes(os)) {
+     throw new Error(`${manifest.name}: unsupported or missing os/cpu metadata`);
+   }
+   if (prebuilds.platform !== `${os}-${cpu}`) {
+@@ -72,8 +72,8 @@ export function verifyPlatformBinaries(packageDir) {
+     if (addon && os === 'linux' && !['glibc', 'musl'].includes(binary.libc)) {
+       throw new Error(`${manifest.name}: Linux addon must declare glibc or musl`);
+     }
+-    if (addon && os === 'darwin' && binary.libc !== undefined) {
+-      throw new Error(`${manifest.name}: macOS addon must not declare a Linux libc`);
++    if (addon && os !== 'linux' && binary.libc !== undefined) {
++      throw new Error(`${manifest.name}: ${os} addon must not declare a Linux libc`);
+     }
+ 
+     const file = path.join(packageDir, binary.path);
+@@ -84,7 +84,7 @@ export function verifyPlatformBinaries(packageDir) {
+       catch { throw new Error(`${manifest.name}: ${binary.path} is not executable`); }
+     }
+     const data = fs.readFileSync(file);
+-    if (os === 'linux') {
++    if (os === 'linux' || os === 'freebsd') {
+       if (data.length < 64 || data.readUInt32LE(0) !== 0x464c457f || data[4] !== 2 || data[5] !== 1) {
+         throw new Error(`${manifest.name}: ${binary.path} is not a little-endian ELF64 binary`);
+       }
+diff --git a/native/system/test/fixtures/flock-import.js b/native/system/test/fixtures/flock-import.js
+index 49ca011fe8..d810407350 100644
+--- a/native/system/test/fixtures/flock-import.js
++++ b/native/system/test/fixtures/flock-import.js
+@@ -7,7 +7,7 @@ try {
+   if (platform) Object.defineProperty(process, 'platform', { value: platform });
+   const { tryLockExclusive } = await import('../../packages/entry/lib/flock.js');
+   assert.equal(typeof tryLockExclusive, 'function');
+-  if (platform || (process.platform !== 'linux' && process.platform !== 'darwin')) {
++  if (platform || !['linux', 'darwin', 'freebsd'].includes(process.platform)) {
+     await assert.rejects(tryLockExclusive(-1), {
+       code: 'ERR_FLOCK_UNSUPPORTED_PLATFORM',
+       syscall: 'flock',
+diff --git a/native/system/test/flock.test.js b/native/system/test/flock.test.js
+index 16e66327e9..258a95da43 100644
+--- a/native/system/test/flock.test.js
++++ b/native/system/test/flock.test.js
+@@ -12,9 +12,9 @@ import { Worker } from 'node:worker_threads';
+ import { tryLockExclusive } from '../packages/entry/lib/flock.js';
+ import { loadFlockBinding } from './fixtures/flock-binding.js';
+ 
+-const posix = process.platform === 'linux' || process.platform === 'darwin';
++const posix = process.platform === 'linux' || process.platform === 'darwin' || process.platform === 'freebsd';
+ const timeout = 120_000;
+-const nativeOnly = { timeout, skip: posix ? false : 'The flock addon requires Linux or macOS' };
++const nativeOnly = { timeout, skip: posix ? false : 'The flock addon requires Linux, macOS, or FreeBSD' };
+ 
+ function resources(t) {
+   const disposers = [];
+@@ -179,7 +179,9 @@ test('import succeeds with native addons disabled', { timeout }, async (t) => {
+   cleanExit(await child.waitForExit());
+ });
+ 
+-for (const platform of ['win32', 'freebsd']) {
++// FreeBSD is a supported target in this fork, so the rejected platforms are
++// the ones the POSIX addon genuinely cannot serve.
++for (const platform of ['win32', 'aix']) {
+   test(`calling flock on ${platform} rejects without loading an addon`, { timeout }, async (t) => {
+     const scope = resources(t);
+     const child = await childFixture(t, scope, 'flock-import.js', [platform], { execArgv: ['--no-addons'] });
+diff --git a/native/system/test/package-matrix.test.js b/native/system/test/package-matrix.test.js
+index 12ea4c3030..d610bf43ef 100644
+--- a/native/system/test/package-matrix.test.js
++++ b/native/system/test/package-matrix.test.js
+@@ -67,7 +67,7 @@ function fixture(t, { platform = 'linux', arch = 'x64', kind = 'node-api' } = {}
+   const spec = { platform: `${platform}-${arch}`, binaries: [binary] };
+   const manifest = { name: 'fixture', os: [platform], cpu: [arch] };
+   const bytes = Buffer.alloc(256);
+-  if (platform === 'linux') {
++  if (platform === 'linux' || platform === 'freebsd') {
+     bytes.writeUInt32LE(0x464c457f, 0);
+     bytes[4] = 2;
+     bytes[5] = 1;
+@@ -90,7 +90,7 @@ function fixture(t, { platform = 'linux', arch = 'x64', kind = 'node-api' } = {}
+   return { dir, file, bytes, binary, spec, manifest, save };
+ }
+ 
+-for (const platform of ['linux', 'darwin']) {
++for (const platform of ['linux', 'darwin', 'freebsd']) {
+   for (const arch of ['x64', 'arm64']) {
+     test(`accepts ${platform}-${arch} addon metadata and header`, (t) => {
+       assert.equal(verifyPlatformBinaries(fixture(t, { platform, arch }).dir).count, 1);
+@@ -132,6 +132,13 @@ test('rejects Linux libc metadata on macOS', (t) => {
+   assert.throws(() => verifyPlatformBinaries(f.dir), /must not declare/);
+ });
+ 
++test('rejects Linux libc metadata on FreeBSD', (t) => {
++  const f = fixture(t, { platform: 'freebsd' });
++  f.binary.libc = 'glibc';
++  f.save();
++  assert.throws(() => verifyPlatformBinaries(f.dir), /must not declare/);
++});
++
+ for (const [offset, value] of [[0, 0], [4, 0], [12, 2]]) {
+   test(`rejects invalid Mach-O field at ${offset}`, (t) => {
+     const f = fixture(t, { platform: 'darwin' });

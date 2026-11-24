@@ -1,0 +1,148 @@
+# deepseek-harness — current-version startup troubleshooting log (1.5 / 192.168.1.5)
+
+- Date: 2026-08-18
+- Host: 192.168.1.5 (FreeBSD, user `workbuddy`)
+- Repo: `/home/workbuddy/github/deepseek-harness`
+- Goal: start the **current** (master) deepseek-harness web, record every error encountered and fix them one by one
+
+## Environment snapshot (before build)
+- git HEAD = `8d0ac97fe6` (= `origin/master`, already current; the last 3 commits are CI workflow changes only, no runtime impact)
+- node v24.12.0 / pnpm 11.7.0 (`~/.local/bin/pnpm`, persisted)
+- Before stopping the old instance: web was healthy on 127.0.0.1:3080 (HTTP 200)
+- 2 pytest CI jobs from other repos were running (~100 MB each); free memory ~3.6 GB (`v_free_count` 918998 × 4 KB)
+- Untracked files: `dsh_web.log`, `freebsd/push.sh`, `validate_build.sh` (local work artifacts, not committed)
+
+## Problem timeline
+
+### [P1] `pgrep -f` self-match made the old web process look alive
+- Symptom: after `sh freebsd/dsh-web-restart.sh stop`, `pgrep -af "dsh:freebsd"` still listed 3 PIDs (95904/21398/97080) and printed PIDs only, no command lines.
+- Root cause: the remote command string itself contains `dsh:freebsd`, so the remote shell (`bash -c '...'`) executing it matches the pattern → pgrep matched **its own shell** (and children), not a leftover web process.
+- Fix: use the bracket trick `pgrep -af "[d]sh:freebsd"` plus `sockstat -l -p 3080` plus `curl` — no match, no listener on 3080, HTTP 000 → the old instance was fully stopped.
+- Lesson: on FreeBSD remote commands, pgrep/pkill patterns must use the `[x]` bracket trick to avoid self-match (already recorded in the skill; hit again).
+
+### [P2] `dsh_ssh.py` argument order: timeout was taken as cwd
+- Symptom: `dsh_ssh.py cmd '<cmd>' 60` failed with `cd: 60: No such file or directory`; the `&&` chain broke and the first half of the command never ran.
+- Root cause: `dsh_ssh.py cmd` takes `cmd <command> [cwd] [timeout]` — the 3rd positional is **cwd**, not timeout; passing `60` was treated as the working directory.
+- Fix: use `-` as the cwd placeholder: `dsh_ssh.py cmd '<cmd>' - 60`.
+- Lesson: this script's `cmd` subcommand needs an explicit `-` cwd placeholder before a timeout can be given.
+
+### [P3] paramiko PipeTimeout while running `dsh-web-restart.sh start`
+- Symptom: `dsh_ssh.py cmd 'sh freebsd/dsh-web-restart.sh start ...'` threw `paramiko.buffered_pipe.PipeTimeout` after ~60 s, exit 1.
+- Root cause: the `daemon`-launched web process inherits the ssh channel's stdout/stderr (or the start script waits for initialization), so the channel never closes after the command "ends" → `stdout.read()` blocks until the timeout. This is a known friction between daemon-style starts and interactive ssh pipe reads (the 0.88 box showed a similar "swallowed output" quirk with rc.d/daemon).
+- Fix: **do not wait for that command to return**; after the timeout, open a fresh ssh channel and verify independently (`sockstat -l -p 3080` / `curl` / `pgrep -af "[d]sh:freebsd"`) — the web server was actually up.
+- Lesson: for daemon/service start commands, either use `dsh_ssh.py bg` (nohup background + separate log) or accept the timeout and verify on a new channel; never treat the timeout as a start failure.
+
+## Build & startup results (all passed)
+- Build: 17:55:27 → 18:00:31 (incremental, 5 min), `BUILD_ALL_OK`; the only output was a vite chunk >500 kB warning (not an error)
+- web: HTTP 200; `sockstat` shows `workbuddy node 12164 tcp4 127.0.0.1:3080`; `dsh_web.log` tail normal
+- Log error scan: `grep -cE "ERROR|SANDBOX_UNAVAILABLE|ENOENT|Traceback|FATAL"` = **0**
+- Process env: `DSH_JAIL_RUN_BIN=/var/dsh-jail-run` (jail sandbox active); no `danger-full-access` (restricted mode)
+- Sandbox smoke: `DSH_JAIL_RUN_BIN=/var/dsh-jail-run node freebsd/verify-sandbox.mjs` = **10/10 PASS** (confine / RO write-denied / workspace-write / network isolation all pass)
+
+## Verification checklist
+- [x] `build:lib:host` passed
+- [x] `build:lib:client` passed
+- [x] `build:web` passed (21.35 s)
+- [x] `BUILD_ALL_OK` present
+- [x] web restarted: HTTP 200
+- [x] `dsh_web.log` no ERROR/exceptions (0 hits)
+- [x] port 3080 listening
+- [x] sandbox smoke (verify-sandbox 10/10, SANDBOX_UNAVAILABLE=0)
+
+## Conclusion
+Current master (`8d0ac97fe6`) builds (incremental) and starts on 1.5 with **zero errors**. This run recorded 3 non-blocking issues (pgrep self-match, `dsh_ssh.py` argument order, daemon-start timeout), all tooling/command-usage problems, none in repo code.
+
+---
+
+## 0.88 (192.168.0.88 / fb98) same-version drill (evening 2026-08-18)
+
+- Host: FreeBSD 15.1-RELEASE-p1, 64 GB RAM (free ~24 GB), node v24.18.0; repo `/home/skywalk/github/deepseek-harness` (**owned by skywalk**), connecting user `workbuddy` (wheel group, sudo).
+- Initial state: HEAD=9d1a0a6097 (10 commits behind); old web running (HTTP 200).
+- Alignment & start: `git fetch origin` (origin=gitcode) → `git reset --hard origin/master` (=7d588f4fe3) → `pnpm run build` (incremental, BUILD_RC=0, web 14.85 s) → `dsh-web-restart.sh start` → verified: HTTP 200, `sockstat` shows `skywalk node 3116 tcp4 127.0.0.1:3080`, `dsh_web.log` 0 errors, `verify-sandbox.mjs` **10/10 PASS**.
+- **0.88-specific operational notes (differ from 1.5)**:
+  1. **git dubious ownership**: workbuddy accessing skywalk-owned repo is blocked by git's safety check → run `git config --global --add safe.directory /home/skywalk/github/deepseek-harness` first (workbuddy global).
+  2. **workbuddy cannot write the repo** (`touch` fails, `.git/FETCH_HEAD` Permission denied) → do all repo operations as skywalk:
+     `python tools/ssh_run_88.py --sudo "su - skywalk -c 'sh /tmp/xxx.sh'"` (script uploaded via `--file` first).
+  3. **boxrun.e2e.ts leftover**: an untracked local copy (0600) imports the removed `boxrunProfileArgs`, which breaks `tsc -b` → master already deleted the file; `mv` the leftover to /tmp as backup and do NOT restore it after building.
+  4. **daemon start hits the same paramiko PipeTimeout** (same family as 1.5) → verify on a fresh channel after the timeout.
+- Conclusion: both hosts (1.5 / 0.88) now run master `7d588f4fe3` with zero-error builds, web HTTP 200, sandbox 10/10 — identical state.
+
+---
+
+## [P4] Reading an image killed the whole web service (`fatal load failure: ErrnoError ... errno: 8`)
+
+Observed repeatedly on this host: a session calls `read_image` (or pastes an image), `read_image` fails with
+`Error: sharp.libvipsVersion is not a function`, and seconds later `dsh_web.log` gains
+`dsh: fatal load failure: ErrnoError { name: 'ErrnoError', errno: 8 }` — the service exits and has to be restarted.
+
+### Root cause (two faults, one symptom)
+
+1. **Sharp on FreeBSD is a WebAssembly build.** There is no native `freebsd-x64` binary, so `sharp` resolves to
+   `@img/sharp-freebsd-wasm32` → `@img/sharp-wasm32`. Its Emscripten runtime builds `/dev/stdin`, `/dev/stdout`,
+   and `/dev/stderr` by calling `fstatSync(0|1|2)` **while the module evaluates**.
+
+2. **A standard descriptor that exists but cannot be stat'ed breaks that startup.** `fstat(1)` prints such a
+   descriptor as `bad` (a merely *closed* descriptor is not listed at all). `fstatSync` then throws `EBADF`, the
+   runtime reports it as an **unhandled rejection** from its own async startup instead of a thrown load error, so
+   `require('sharp')` "succeeds" with a half-initialized binding:
+   - the first raster operation fails with `sharp.libvipsVersion is not a function`, and
+   - `installFailLoud` (correctly) treats the stray `ErrnoError` rejection as fatal and exits the process.
+
+   FreeBSD's `revoke(2)` produces exactly this descriptor state — it invalidates the descriptors on a terminal when
+   the controlling session ends, which is what sshd does to a service. On this host the live service showed
+   `0 - - bad -` in `fstat` while the process was still listening on `:3080`.
+
+### Reproduction (deterministic)
+
+Closing the three standard descriptors before the first `sharp` load reproduces the production pair exactly:
+
+```
+closed 0:EBADF 1:EBADF 2:EBADF
+RAW THREW sharp.libvipsVersion is not a function
+UNHANDLED ErrnoError errno=8
+```
+
+`revoke(2)` on the process's own pty yields the same `0:EBADF 1:EBADF 2:EBADF` first line, i.e. the same failure.
+Note that `bad` descriptors are *not* repaired by retrying `require('sharp')` — the Emscripten module is already
+initialized and cached in a broken state, so a retry keeps failing.
+
+### Fix
+
+- `packages/attachment/attachment-local/src/sharp.ts`: `ensureStandardStreams()` stats 0/1/2 and rebinds every
+  unusable one to `/dev/null` (`closeSync` then `openSync`, so the lowest-free-descriptor rule refills the same
+  slot). `requireSharp()` runs it before the load; a descriptor that cannot be restored refuses the load instead of
+  triggering the fatal rejection. `LocalAttachmentStore`'s constructor runs the same repair at mount time, so the
+  repair happens at startup rather than on the first image.
+- `freebsd/dsh_web.rcd` and `freebsd/dsh-web-restart.sh`: start the service with `</dev/null`, so a supervised
+  process never inherits a stale descriptor 0.
+- Verified against the same broken state: `repaired=[0,1,2]` → the read_image pipeline returns image bytes.
+- Regression test: `packages/attachment/attachment-local/tests/standard-streams.spec.ts`.
+
+### Fix (second, unrelated bug found while investigating)
+
+`freebsd/dsh_web.rcd` and `freebsd/dsh-web-restart.sh` matched the service with a `pgrep -f` / `pkill -f` substring.
+Two separate FreeBSD behaviors broke that, and the fix has to handle both:
+
+1. **`pgrep`/`pkill` skip themselves and all direct ancestors** unless `-a` is given. These scripts are normally run
+   from inside a dsh session, and the harness process is then an ancestor, so `sh freebsd/dsh-web-restart.sh status`
+   reported `NOT running` for a perfectly healthy service, and `stop`/`restart` could claim success without touching
+   it.
+2. **`-a` alone overshoots.** `pkill -a -f "dsh:freebsd"` also matches any shell whose command line merely mentions
+   the string, so a stop could kill an unrelated ssh or editing session. Verified: a `sh -c '...' dsh:freebsd-decoy`
+   process is selected by the substring pattern and not by the final matcher.
+
+Both scripts now identify the harness by its **exact argv** — a process whose `comm` is `node` and whose `args`
+starts with `node /usr/local/bin/pnpm dsh:freebsd` — and signal those PIDs explicitly instead of using `pkill`.
+That is independent of who invoked the script, and it cannot match a shell that only talks about `dsh:freebsd`.
+`stop` also warns when the caller is a descendant of the service it is about to end.
+
+`freebsd/verify-service-match.sh` asserts both properties and the `status` path; it exits non-zero if the matcher
+and the scripts ever drift apart.
+
+### Lessons
+
+- On FreeBSD, treat `fstat(1)`'s `bad` as "descriptor present but unstatable", not "closed".
+- A dependency whose *async* startup reports failures as unhandled rejections can crash a process that has a
+  fail-loud handler, even though the failing call is unrelated to the reject site.
+- FreeBSD `pgrep`/`pkill` need `-a` to see ancestors — but for anything that *signals* processes, `-a` plus a
+  substring is still wrong: match the exact argv and signal explicit PIDs.

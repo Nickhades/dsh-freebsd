@@ -1,0 +1,9 @@
+# Patch series, applied in file-name order by scripts/apply.sh.
+# Format: <patch-file><TAB><git pathspecs>.
+# scripts/regen.sh uses the pathspecs to regenerate a patch from a git tree.
+0001-build-config.patch	package.json pnpm-workspace.yaml pnpm-lock.yaml .gitignore patches/node-pty@1.2.0-beta.15.patch
+0002-native-system.patch	native/system
+0003-sandbox-jail.patch	packages/sandbox
+0004-platform-runtime.patch	packages/subprocess/subprocess-local/src/process-inspector.ts packages/terminal/terminal-bash/src/config.ts packages/util/ripgrep packages/util/native-command packages/fs/tool-fs-search/tests packages/boot/app-boot/src/profile-resolution/resolver.ts apps/web/src/main.ts apps/web/src/polyfill-crypto.ts vendor/loader/src/internal.ts vendor/README.md scripts/gen-config-catalog.ts scripts/gen-cordis-catalog.ts
+0005-headless-fixes.patch	packages/attachment/attachment-local packages/api/settings-controller packages/client/ui-settings-general
+0006-postmortem-index.patch	docs/postmortem/README.md docs/postmortem/README.zh.md docs/postmortem/README.i18n.yaml

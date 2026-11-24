@@ -1,0 +1,30 @@
+diff --git a/docs/postmortem/README.i18n.yaml b/docs/postmortem/README.i18n.yaml
+index 5002c68cdd..18d10f41a2 100644
+--- a/docs/postmortem/README.i18n.yaml
++++ b/docs/postmortem/README.i18n.yaml
+@@ -3,5 +3,5 @@
+ # After editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write docs/postmortem/README.md
+ /post-mortems:
+-  en: 3bd772313d364d9f
+-  zh: e84d0e90f62431fb
++  en: 1ef1d98c7d2e64a8
++  zh: b078a47268c837c0
+diff --git a/docs/postmortem/README.md b/docs/postmortem/README.md
+index ffde005730..42757a309f 100644
+--- a/docs/postmortem/README.md
++++ b/docs/postmortem/README.md
+@@ -16,3 +16,4 @@ Every post-mortem opens with an **Executive summary**: one short paragraph a bus
+ | [0002](0002-js-expression-disabled-filesystem-tools.md) | Filesystem snapshot tools were permanently disabled by a literal `!!js` object |
+ | [0003](0003-web-agent-gui-feedback-loop.md) | Web agent validated a replacement server instead of the GUI hosting its session |
+ | [0004](0004-landlock-partial-notice-misclassified-child-failures.md) | Landlock partial-enforcement notice misclassified child failures |
++| [0005](0005-bad-stdio-descriptor-crashed-on-image-read.md) | A bad stdio descriptor crashed the service on every image read |
+diff --git a/docs/postmortem/README.zh.md b/docs/postmortem/README.zh.md
+index 4b3f8588cc..5ede9f8d09 100644
+--- a/docs/postmortem/README.zh.md
++++ b/docs/postmortem/README.zh.md
+@@ -16,3 +16,4 @@
+ | [0002](0002-js-expression-disabled-filesystem-tools.zh.md) | 文件系统快照工具被一个字面量 `!!js` 对象永久禁用 |
+ | [0003](0003-web-agent-gui-feedback-loop.zh.md) | Web agent（智能体）验证了替代服务器，而非承载其会话的 GUI |
+ | [0004](0004-landlock-partial-notice-misclassified-child-failures.zh.md) | Landlock 部分强制执行通知导致子进程失败被误归类 |
++| [0005](0005-bad-stdio-descriptor-crashed-on-image-read.zh.md) | 一个失效的 stdio 描述符让服务在每次读图时崩溃 |
