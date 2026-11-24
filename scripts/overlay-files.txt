@@ -36,3 +36,6 @@ dsh-freebsd-port/tools/port-test.sh
 docs/postmortem/0005-bad-stdio-descriptor-crashed-on-image-read.md
 docs/postmortem/0005-bad-stdio-descriptor-crashed-on-image-read.zh.md
 docs/postmortem/0005-bad-stdio-descriptor-crashed-on-image-read.i18n.yaml
+dsh-freebsd-port/TASK-LOG-2026-10-18.md
+dsh-freebsd-port/TASK-LOG-2026-11-05.md
+dsh-freebsd-port/TASK-LOG-2026-11-15-rc3.md

@@ -101,8 +101,11 @@ dsh_web_precmd() {
 dsh_web_service_pids() {
     for _p in $(ps -axo pid= 2>/dev/null); do
         [ "$(ps -p "$_p" -o comm= 2>/dev/null)" = "node" ] || continue
+        # Match the node layer that runs the pnpm script, at whatever path pnpm
+        # was installed (npm -g, ~/.npm-global, or a workspace shim). The node
+        # comm check keeps shells and editors that merely mention the string out.
         case "$(ps -p "$_p" -o args= 2>/dev/null)" in
-            "node /usr/local/bin/pnpm dsh:freebsd"|"node /usr/local/bin/pnpm dsh:freebsd "*) printf '%s\n' "$_p" ;;
+            *pnpm*" dsh:freebsd"*) printf '%s\n' "$_p" ;;
         esac
     done
 }

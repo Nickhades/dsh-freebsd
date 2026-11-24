@@ -22,17 +22,15 @@ PORT=3080
 #      shell whose command line merely mentions the string, so stopping the
 #      service could kill an unrelated editing/ssh session.
 #
-# Matching the node process whose argv starts with `node <pnpm> dsh:freebsd`
-# has neither problem: it is independent of who invoked the script, and it
-# cannot match a shell that only talks about dsh:freebsd.
-SERVICE_ARGV="node /usr/local/bin/pnpm dsh:freebsd"
-
-# Print the pid of each service process, one per line.
+# Matching a node process whose argv runs the pnpm script with `dsh:freebsd`
+# has neither problem: it is independent of who invoked the script and of where
+# pnpm is installed, and the node comm check cannot match a shell that only
+# talks about dsh:freebsd.
 service_pids() {
     for _p in $(ps -axo pid= 2>/dev/null); do
         [ "$(ps -p "$_p" -o comm= 2>/dev/null)" = "node" ] || continue
         case "$(ps -p "$_p" -o args= 2>/dev/null)" in
-            "$SERVICE_ARGV"|"$SERVICE_ARGV "*) printf '%s\n' "$_p" ;;
+            *pnpm*" dsh:freebsd"*) printf '%s\n' "$_p" ;;
         esac
     done
 }

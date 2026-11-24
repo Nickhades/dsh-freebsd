@@ -1,9 +1,9 @@
 # DeepSeek Harness 在 FreeBSD 上的安装与运行手册
 
-> **重要：FreeBSD 请用本 fork（`skywalk163/deepseek-harness`），不要克隆上游 `deepseek-ai/deepseek-harness`。**
-> FreeBSD 移植补丁（`process-inspector` 的 ps 语法修复、`terminal-bash` 默认 shell 修复、`crypto.randomUUID` polyfill、仅环回地址的信任围栏）**尚未合并到上游**，只维护在本仓库。克隆上游会缺少这些修复。
+> **重要：FreeBSD 请用「上游 + `dsh-freebsd` 覆盖层」，不要从裸上游构建。**
+> FreeBSD 改动（`process-inspector` 的 ps 语法修复、`terminal-bash` 的 bash 硬依赖、`crypto.randomUUID` polyfill、ripgrep 回退、flock addon 与 jail 沙箱后端）**尚未合并到上游**。本文描述的是把覆盖层的 6 个补丁与覆盖文件应用到上游 `dsh-v0.2.2-rc.5` 之后的树；构建命令以覆盖层 README 为准。
 
-本手册把从「全新 FreeBSD」到「`dsh web` 跑起来」的所有步骤串成一条线，新手照抄命令即可装成功。所有命令均已在 FreeBSD 14.3-RELEASE amd64（Node 24）验证；FreeBSD 15.x 同样适用（第 2 步已覆盖 15.1 上 `pnpm install` 报错的根因与修复）。
+本手册把从「全新 FreeBSD」到「`dsh web` 跑起来」的所有步骤串成一条线，新手照抄命令即可装成功。当前版本已在 **FreeBSD 15.1-RELEASE-p7 amd64**、Node 22.23.5、pnpm 11.28.5 上通过 `dsh-freebsd` 覆盖层验证（见第 14 节）；旧的 14.3 记录仍然适用，第 2 步已覆盖 15.1 上 `pnpm install` 报错的根因与修复。
 
 ---
 
@@ -150,20 +150,22 @@ disturl=https://registry.npmmirror.com/-/binary/node
 
 ---
 
-## 6. 克隆仓库（从咱们自己的 fork）
+## 6. 取得构建树（上游 + FreeBSD 覆盖层）
+
+**不要**直接克隆裸上游：FreeBSD 修复没有合并进去。用 `dsh-freebsd` 覆盖层，
+它会取固定的上游提交并打上 FreeBSD 补丁：
 
 ```sh
-cd ~
-git clone https://gitcode.com/skywalk163/deepseek-harness.git
-# 或 GitHub 镜像：
-# git clone https://github.com/skywalk163/deepseek-harness.git
-cd deepseek-harness
-git log --oneline -1   # 应看到 FreeBSD 移植相关提交
+git clone <dsh-freebsd 覆盖层仓库> ~/dsh-freebsd
+cd ~/dsh-freebsd
+sh scripts/build.sh --from-local /path/to/上游检出处   # GitHub 可达时可不带参数
 ```
 
-> 不要克隆上游 `deepseek-ai/deepseek-harness`——FreeBSD 补丁尚未合并，上游缺这些修复。
+产物是 `.work/tree`，也就是本手册所说的「仓库根」。后续步骤都在这里执行（或显式
+传该路径）。完整的构建/升级流程以覆盖层 README 为准。
 
-> **全新克隆不需要任何清理**，直接进第 7 步。只有「**在原地升级**」的 checkout 才要多做一步 `pnpm run clean`；见 7.1 节。
+> **全新构建的树不需要任何清理**，直接进第 7 步。只有在原地升级过的树才要多做一步
+> `pnpm run clean`；见 7.1 节。
 
 ---
 
@@ -274,96 +276,25 @@ sh /tmp/dsh-jail-test.sh   # 降权到调用者 uid、cwd=/workspace、只读拒
 
 ---
 
-### 8.2 在第二台机器上部署 —— fb98（192.168.0.88）要点
+### 8.2 第二台机器上的注意事项
 
-上面的步骤在 `192.168.1.5`（FreeBSD 14.3，仓库在 `/home/workbuddy/github/deepseek-harness`）验证通过。同一套流程已复刻到第二台机器 **fb98 / 192.168.0.88（FreeBSD 15.1-RELEASE-p1）**。这里把差异以及该机特有的两个坑记下来，方便再次部署可复现。
+覆盖层的构建是通用的；这里记录不同 FreeBSD 15.x 机器上会变的主机事实和踩过的坑。
 
-**与 192.168.1.5 的环境差异**
-
-| 项 | 192.168.1.5 | fb98 / 192.168.0.88 |
-| --- | --- | --- |
-| 仓库路径 / 用户 | `/home/workbuddy/github/deepseek-harness`（workbuddy） | `/home/skywalk/github/deepseek-harness`（skywalk） |
-| FreeBSD | 14.3-RELEASE amd64 | 15.1-RELEASE-p1 amd64 |
-| `/usr` 挂载 | **只读** → 二进制放 `/var/dsh-jail-run` | **可写**，但仍把二进制装到 `/var/dsh-jail-run`，以对齐仓库脚本默认的 `DSH_JAIL_RUN_BIN` |
-| `kern.racct.enable` | `1` | `0` —— **不是阻塞项**（见下注） |
-| `nullfs` / `tmpfs` | nullfs 已加载，tmpfs 内建 | 相同（nullfs 运行时已加载；tmpfs 内建于 GENERIC） |
-
-> ⚠️ **两台机器的 `/tmp` 都是 `nosuid` 的 ZFS 数据集** —— 千万别把 setuid 的 `dsh-jail-run` 装到那里，否则 setuid 位被忽略、helper 静默失效。用 `/var/dsh-jail-run`（或在 `/usr` 可写的机器上用 `/usr/local/sbin/dsh-jail-run`）。
-
-**第 0 步 —— 把仓库升到含沙箱的提交**
-
-fb98 上原本是一份**老** checkout，**没有** FreeBSD jail 沙箱代码（`freebsd/dsh-jail-run.c`、`packages/sandbox/sandbox-local/`、`packages/sandbox/sandbox/` 全缺）。先对齐 `origin/master`：
-
-```sh
-cd /home/skywalk/github/deepseek-harness
-git fetch origin
-git reset --hard origin/master     # 现在 9d1a0a6097，含 jail 沙箱 + 本手册
-git log --oneline -1               # 9d1a0a6097 ...
-ls freebsd/dsh-jail-run.c packages/sandbox/sandbox-local/src   # 必须存在
-```
-
-**坑 A —— `pnpm build:lib`（host）被一个坏测试文件中断**
-
-`pnpm run build` / `pnpm build:lib:host` 会对每个包跑 `tsc -b`，**包括** `packages/sandbox/sandbox-local/tests/**`。在 `origin/master` 上，`packages/sandbox/sandbox-local/tests/boxrun.e2e.ts` 仍从 `profiles.ts` import 已删除的 `boxrunProfileArgs`（TS2305），导致 `tsc -b` 中断，于是 `@deepseek-ai/dsh-sandbox-local` 的 `lib/` **根本产不出** —— 而早先 boxrun 时代残留的 `lib/` 会错误地选 `/usr/local/sbin/boxrun` 而非 `dsh-jail-run`。
-
-现象：
-
-```
-packages/sandbox/sandbox-local/tests/boxrun.e2e.ts:8:10
-  error TS2305: Module '.../profiles' has no exported member 'boxrunProfileArgs'.
-```
-
-修复 —— 临时把该测试移出、构建、再还原（该测试文件不进入 `lib` 产物，所以不改任何发布代码）：
-
-```sh
-mv packages/sandbox/sandbox-local/tests/boxrun.e2e.ts /tmp/boxrun.e2e.ts.bak
-pnpm build:lib:host           # tsc -b + tsdown → 产出 lib/
-# 还原：
-mv /tmp/boxrun.e2e.ts.bak packages/sandbox/sandbox-local/tests/boxrun.e2e.ts
-```
-
-> 若 `git checkout -- <文件>` 报 "not known to git"，说明该测试文件未受 git 跟踪（例如被 gitignore）—— 从 `/tmp` 移回原位即可，如上所示。仓库工作树保持干净。
-
-验证重建后的 lib 真的选了 jail 后端（而非 boxrun）：
-
-```sh
-DSH_JAIL_RUN_BIN=/var/dsh-jail-run node freebsd/verify-sandbox.mjs
-# PASS=10 FAIL=0  （selected backend 一行显示 dsh-jail-run，而非 boxrun）
-```
-
-> **`kern.racct.enable: 0` 没问题。** `freebsd/dsh-jail-run.c` 用 `rctl -a ... 2>/dev/null` 加资源限制（忽略错误），所以没有 RACCT/RCTL 记账也不影响 jail 运行——后端照样可用。别把 `kern.racct.enable: 0` 当成失败。
-
-**坑 B —— rc.d 能起但 app 报 `EACCES: /.dsh`（`$HOME` 缺失）**
-
-手动用 `su skywalk -c '...'` 启动时，会话继承 `HOME=/home/skywalk`，web 正常。但 **rc.d 服务** 以**空 `$HOME`**（默认 `/`）拉起命令，于是 harness 试图 `mkdir /.dsh/profiles/node_modules`，直接挂：
-
-```
-Error: EACCES: permission denied, mkdir '/.dsh/profiles/node_modules'
-```
-
-修复 —— 在 `rc.conf` 里告诉 rc.d 家目录：
-
-```sh
-sysrc dsh_web_env="HOME=/home/skywalk"    # 与 dsh_web_enable=YES 等并列设置
-service dsh_web restart
-```
-
-不想手改也行：`sh freebsd/install-service.sh`（§11.1）会把这个变量——以及与本 checkout 匹配的 `dsh_web_user`——一起写好。
-
-此后 `service dsh_web start`（即开机走的路径）正常，运行进程的环境里 `HOME=/home/skywalk`。
-
-> ⚠️ 任何会留下长驻进程的 `service dsh_web ...` / `daemon` 调用都会**吞掉 SSH helper 的命令回显**（shell 在 daemon 脱离前就返回了）。务必用**另一条独立命令**做状态核查（`pgrep -f dsh:freebsd`、`fetch -qo - http://127.0.0.1:3080`、统计日志里 `SANDBOX_UNAVAILABLE` 的次数），别信启动命令的 stdout。
-
-**fb98 终检状态**
-
-| 核查项 | 结果 |
+| 项目 | 影响 |
 | --- | --- |
-| setuid helper `/var/dsh-jail-run` | `-rwsr-xr-x root:wheel`，jail 内 `pwd` → `/workspace` |
-| `freebsd/verify-sandbox.mjs` | PASS=10 FAIL=0 |
-| `pnpm vitest run packages/sandbox/sandbox-local/tests/freebsd-jail.e2e.ts` | 5/5 |
-| web（`:3080`） | HTTP 200，`DSH_JAIL_RUN_BIN=/var/dsh-jail-run`，未设 `danger-full-access`（默认 jail 受限） |
-| 日志中 `SANDBOX_UNAVAILABLE` | 0 |
-| rc.d 开机自启 | `dsh_web_enable=YES` + `dsh_web_env="HOME=/home/skywalk"` |
+| `/tmp` 是 `nosuid` 数据集 | 绝不能把 setuid 的 `dsh-jail-run` 装在这里：内核会忽略 setuid 位，助手静默地提不了权。用 `/var/dsh-jail-run`（`/usr` 可写时用 `/usr/local/sbin/dsh-jail-run`）。 |
+| `kern.racct.enable: 0` | 不是阻塞项。`dsh-jail-run` 用 `rctl -a ... 2>/dev/null` 设限；没有 RACCT 时 jail 照常运行，只是没有资源上限。 |
+| rc.d 的 `$HOME` 为空 | `rc.subr` 用 `su -m` 切到 `dsh_web_user`，必须显式设置 `HOME`，否则 harness 会去 `mkdir /.dsh`。`install-service.sh` 按检出属主写入 `dsh_web_env="HOME=..."`；rc.d 脚本也会默认成服务用户的家目录。 |
+| `/usr` 只读 | 把助手装到 `/var`，并让 `DSH_JAIL_RUN_BIN` 指向那里（`freebsd/dsh-web-run.sh` 默认就是 `/var`）。 |
+
+验证部署不要只看启动命令的 stdout（`service`/`daemon` 会 detach 并吞掉输出），
+要用独立命令检查 token、监听端口和沙箱后端：
+
+```sh
+sh freebsd/dsh-web-restart.sh status
+DSH_JAIL_RUN_BIN=/var/dsh-jail-run sh freebsd/run-verify.sh   # PASS=10 FAIL=0
+sh freebsd/run-e2e.sh                                         # 5/5
+```
 
 ---
 
@@ -473,29 +404,17 @@ DSH_PROJECT_DIR=/home/skywalk/dswork sh freebsd/dsh-web-restart.sh restart   # �
 
 - `pnpm` 要持久化（本机在 `/home/<user>/.local/bin/pnpm` v11.28.5），别用 `/tmp/p117` 这类重启会被清的路径。
 - rc.d 的 `pidfile` 与日志放在仓库内（`dsh_web.pid`、`dsh_web.log`）以避开 `/tmp` 清理、重启不丢。
-- rc.d 服务以 `dsh_web_user` 运行。它的内置默认值是 `workbuddy`；如果 checkout 属主是别人，没设 `dsh_web_user` 正是手工装的服务起不来的原因。`install-service.sh` 会自动推出来。
+- rc.d 服务以 `dsh_web_user` 运行。它的内置默认值是 `www`；如果 checkout 属主是别人，没设 `dsh_web_user` 正是手工装的服务起不来的原因。`install-service.sh` 会按检出属主推导出来。
 
 ---
 
-## 12. Git：三远端与 lefthook 绕过（仅当你要往回推补丁）
+## 12. 版本控制
 
-本仓库三远端：
+构建树是用 `git archive` 解出来的，没有 `.git`。来源记录在
+`.work/tree/.dsh-freebsd-overlay`：覆盖层版本 + 上游提交。
 
-```sh
-git remote -v
-# origin   https://gitcode.com/skywalk163/deepseek-harness (fetch/push)
-# github   git@github.com:skywalk163/deepseek-harness.git
-# gitea    http://192.168.1.5:3000/skywalk/deepseek-harness.git
-```
-
-提交 / 推送时，**lefthook 的 `gen-third-party-notices` 等钩子会因 `@anthropic-ai/claude-agent-sdk-linux-x64`（仅 Linux 构建）在 FreeBSD 失败**，与你的改动无关。绕过：
-
-```sh
-git commit --no-verify
-git -c core.hooksPath=/tmp/nohooks push <remote> <branch>
-```
-
-（推 gitcode / gitea 时按需在 URL 注入 token，见仓库既有约定。）
+要把修复带下去，请改覆盖层的补丁序列（见其 README 的「跟随上游升级」），而不是
+直接改构建树。托管 CI 工作流和 fork 专用的 push/sync 脚本刻意不作为覆盖层的一部分。
 
 ---
 
@@ -513,18 +432,29 @@ git -c core.hooksPath=/tmp/nohooks push <remote> <branch>
 | `node-pty` 编译失败 / ETIMEDOUT 拉 Node 头文件 | node-gyp 拉不到头文件 | 保留 `.npmrc` 的 `disturl`；确保 gmake shim 在 `PATH`。 |
 | `PTY shell exited during startup` / `terminal-bash: ... does not exist` | 没装 bash（FreeBSD 默认 `/bin/sh`） | `pkg install bash`；该后端不能用默认 sh。 |
 | `gen-third-party-notices` 钩子 commit / push 失败 | 上游钩子要 Linux-only 的 claude-agent-sdk | FreeBSD 平台不兼容，与改动无关；`git commit --no-verify` 或 `git -c core.hooksPath=/tmp/nohooks push`。 |
-| `grep` / `glob` 报 `could not start its search command (ripgrep launch failed)` | `@vscode/ripgrep` 在 FreeBSD 无原生二进制，其 `rgPath` 指向缺失文件 | `pkg install ripgrep`，`grep`/`glob` 工具会自动回退到系统 `rg`（或设 `DSH_RIPGREP_PATH` 指向你的 `rg`）。代码修复在 `packages/fs/tool-fs-search/src/search-core.ts`。 |
+| `grep` / `glob` 报 `could not start its search command (ripgrep launch failed)` | `@vscode/ripgrep` 在 FreeBSD 无原生二进制，其 `rgPath` 指向缺失文件 | `pkg install ripgrep`，`grep`/`glob` 工具会自动回退到系统 `rg`（或设 `DSH_RIPGREP_PATH` 指向你的 `rg`）。覆盖层补丁 0004 已修在 `packages/util/ripgrep/src/index.ts`。 |
 | `bash` / `grep` 落在 `$HOME`（或仓库根）而非任务里设的项目目录 | 本 fork 尚未把任务的"项目目录"字段接进 `session.header.cwd`，命令 cwd 回退到 `process.cwd()`（即 `dsh web` 启动目录） | 显式指定项目：启动加 `DSH_PROJECT_DIR=/项目路径`，或在 rc.d 服务里 `sysrc dsh_web_projectdir="/项目路径"`。`freebsd/dsh-web-run.sh` 启动器会 cd 进去。 |
 | `tsc -b` 报 `error TS2305: ... has no exported member 'boxrunProfileArgs'`（host 构建） | 陈旧的 `boxrun.e2e.ts` 测试引用了已删除的符号，导致 `dsh-sandbox-local` 的 `lib/` 产不出、harness 回退到 boxrun | 临时 `mv` 该测试出目录，跑 `pnpm build:lib:host`，再还原。见 8.2 节。 |
 | `service dsh_web start` 报 `dsh_web: not found`，但 `rc.conf` 里明明有 `dsh_web_enable="YES"` | 只设了 rc.conf 开关，**rc.d 脚本本身从未装到这台机器上**（全新机器，或从没跑过安装脚本） | `sh freebsd/install-service.sh`：写好 `/usr/local/etc/rc.d/dsh_web` 与剩余 rc.conf 变量，然后启动并验证。只想装不想启就加 `--no-start`。 |
-| 服务起来了，但写不进仓库（`dsh_web.pid` / `dsh_web.log` 报错），或 `su` 直接失败 | `dsh_web_user` 不是 checkout 的属主（rc.d 内置默认是 `workbuddy`） | `sh freebsd/install-service.sh --status` 会把这对不匹配的值摆出来；重跑安装脚本即可从 checkout 属主推导出 `dsh_web_user`。 |
+| 服务起来了，但写不进仓库（`dsh_web.pid` / `dsh_web.log` 报错），或 `su` 直接失败 | `dsh_web_user` 不是 checkout 的属主（rc.d 内置默认是 `www`） | `sh freebsd/install-service.sh --status` 会把这对不匹配的值摆出来；重跑安装脚本即可从 checkout 属主推导出 `dsh_web_user`。 |
 | web 启动时（仅 rc.d 路径）报 `EACCES: permission denied, mkdir '/.dsh/...'` | rc.d 以空 `$HOME`（默认 `/`）拉起命令 | `sysrc dsh_web_env="HOME=/home/skywalk"`；见 8.2 节。 |
-| 报 `flock is not supported on freebsd-x64`，界面显示"本轮运行失败"，**任何模式**（含极简模式）都会 | `@deepseek-ai/node-addon-system/flock` 只声明了 Linux/macOS 目标，而 `native/system/scripts/build.ts` 在 FreeBSD 上静默退出，插件从未被构建；而每次写会话都要取这个租约 | 本移植已修复：新增 `freebsd-x64` 平台包，并给构建脚本加了 FreeBSD 分支。执行 `git pull && pnpm install && pnpm run build:native-system`，然后重启服务（`service dsh_web restart`）。 |
+| 报 `flock is not supported on freebsd-x64`，界面显示"本轮运行失败"，**任何模式**（含极简模式）都会 | `@deepseek-ai/node-addon-system/flock` 只声明了 Linux/macOS 目标，而 `native/system/scripts/build.ts` 在 FreeBSD 上静默退出，插件从未被构建；而每次写会话都要取这个租约 | 覆盖层补丁 0002 已修复：新增 `freebsd-x64` 平台包，并给构建脚本加了 FreeBSD 分支。执行 `pnpm install && pnpm run build:native-system`，然后重启服务（`service dsh_web restart`）。 |
 | `build:lib:host` 阶段报 `ERROR Error: [@deepseek-ai/dsh-root] Cannot find entry: ["lib/types/{index,startup}.js"]`，最终 `build: build:lib exited with 1` | **原地升级**留下「无 manifest 的包壳」（只剩被 gitignore 的 `node_modules/` + `lib/`）；它们仍匹配 workspace glob `packages/*/*`，于是 `tsdown` 把它解析到最近的 `package.json`（仓库根 `@deepseek-ai/dsh-root`）。`git status` 看不到它们，因为残留全是被忽略的内容 | 先跑 `for d in packages/*/*/; do [ -f "$d/package.json" ] || echo "STALE: $d"; done`，再 `pnpm run clean`（或把这些目录 `mv` 出仓库）。**全新克隆不会踩**——只影响原地升级。见 7.1 节。 |
 
 ---
 
 ## 14. 已验证项
+
+覆盖层构建已在 **2026-11-24**、`dsh-v0.2.2-rc.5`、FreeBSD 15.1-RELEASE-p7
+amd64（16 核 / 16 GB，Node 22.23.5，pnpm 11.28.5）上验证：
+`sh scripts/build.sh --from-local …` 把 6 个补丁应用到干净的上游树，
+`pnpm install` 复用 1428 个 store 包并用 FreeBSD 头文件编译 `node-pty`，
+`pnpm run build` **213 秒**完成，**10/10 个 gate** 通过、产出 **371 个 client
+artifact**。随后 `scripts/verify.sh` 通过：CLI 产物（`0.2.2-rc.5`）、Web
+bundle、FreeBSD `flock` addon、helper 的 `-ljail` 编译、定向测试
+（`util/ripgrep` 路径回退、`util/native-command`、sandbox local），以及用临时
+`DSH_HOME` 在环回地址启动并返回 HTTP 200 的 Web 冒烟。Node 22 会打印一条
+`Unsupported engine` 警告，Node 24 没有。
 
 `node-pty` 原生编译通过；`sharp` 经 WASM 渲染；`pnpm run build` 完整跑通（`tsc -b` + `tsdown` + `vite`）；`dsh web` 在环回地址上以 HTTP 提供 UI。Node-API 的 `flock` 插件用系统 `cc` 从源码编译通过，其所属原生测试套件在 FreeBSD 上 **52/52** 全绿（`node --test native/system/test/flock.test.js native/system/test/package-matrix.test.js`），包含独立的 C oracle 加锁交叉验证与会话写租约（`SessionWriteLease`：获取、互斥、释放后移交）。
 

@@ -16,7 +16,7 @@
 
 - **6 个补丁**，针对固定的上游提交（构建配置、原生 addon、jail 沙箱、平台运行时、
   无头修复、文档索引）。
-- **30 个覆盖文件**，上游树里本来没有（`freebsd/` 运维脚本、setuid jail 助手源码、
+- **39 个覆盖文件**，上游树里本来没有（`freebsd/` 运维脚本、setuid jail 助手源码、
   FreeBSD 手册、port）。
 
 其余部分——agent、插件、Web UI、测试——原样来自上游。上游挪动文件时，
@@ -158,8 +158,11 @@ addon、jail 助手编译、`--version`，并用临时 `DSH_HOME` 在 loopback �
 （要求打印 token 且返回 HTTP 200）。`--tests` 追加定向单测（`util/ripgrep`、
 `util/native-command`、sandbox local）。
 
-本修订记录的构建在 **FreeBSD 15.1-RELEASE-p7 amd64**、Node 22.23.5、
-pnpm 11.28.5 上完成。
+本修订记录的构建在 **FreeBSD 15.1-RELEASE-p7 amd64**（16 核 / 16 GB）、
+Node 22.23.5、pnpm 11.28.5 上完成：6 个补丁应用到干净的 `dsh-v0.2.2-rc.5` 树，
+`pnpm install` 复用 1428 个 store 包并用 FreeBSD 头文件编译 `node-pty`，
+`pnpm run build` **213 秒**完成，**10/10 个 gate** 通过、产出 **371 个 client
+artifact**，上述验证全部通过。
 
 ## 排错
 

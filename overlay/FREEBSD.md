@@ -1,9 +1,9 @@
 # DeepSeek Harness on FreeBSD — Installation & Runbook
 
-> **Important: on FreeBSD use this fork (`skywalk163/deepseek-harness`), not upstream `deepseek-ai/deepseek-harness`.**
-> The FreeBSD port patches (the `process-inspector` ps-syntax fix, the `terminal-bash` default-shell fix, the `crypto.randomUUID` polyfill, and the loopback-only trust fence) are **not yet merged upstream** and are only maintained in this repository. Cloning upstream would leave those fixes out.
+> **Important: on FreeBSD, build from upstream plus the `dsh-freebsd` overlay, not from bare upstream.**
+> The FreeBSD changes (the `process-inspector` ps-syntax fix, the `terminal-bash` bash requirement, the `crypto.randomUUID` polyfill, the ripgrep fallback, the flock addon and the jail sandbox backend) are **not merged upstream**. This document describes a tree produced by applying the overlay's six patches and overlay files to upstream `dsh-v0.2.2-rc.5`; the overlay README owns the build commands.
 
-This runbook strings every step from "fresh FreeBSD" to "`dsh web` running" into one linear, copy-paste flow. All commands are verified on FreeBSD 14.3-RELEASE amd64 (Node 24); FreeBSD 15.x works the same (step 2 covers the root cause and fix for the `pnpm install` error seen on 15.1).
+This runbook strings every step from "fresh FreeBSD" to "`dsh web` running" into one linear, copy-paste flow. The current line is verified on **FreeBSD 15.1-RELEASE-p7 amd64** with Node 22.23.5 and pnpm 11.28.5 through the `dsh-freebsd` overlay (§14); the older 14.3 notes still apply, and step 2 covers the root cause of the `pnpm install` error seen on 15.1.
 
 ---
 
@@ -150,20 +150,24 @@ disturl=https://registry.npmmirror.com/-/binary/node
 
 ---
 
-## 6. Clone the repo (from our own fork)
+## 6. Get the tree (upstream + FreeBSD overlay)
+
+Do **not** clone bare upstream: the FreeBSD fixes are not merged there. Build from the
+`dsh-freebsd` overlay, which fetches the pinned upstream commit and applies the
+FreeBSD patches:
 
 ```sh
-cd ~
-git clone https://gitcode.com/skywalk163/deepseek-harness.git
-# or the GitHub mirror:
-# git clone https://github.com/skywalk163/deepseek-harness.git
-cd deepseek-harness
-git log --oneline -1   # should show a FreeBSD-port commit
+git clone <dsh-freebsd overlay repository> ~/dsh-freebsd
+cd ~/dsh-freebsd
+sh scripts/build.sh --from-local /path/to/an/upstream/checkout   # omit the flag when GitHub is reachable
 ```
 
-> Do not clone upstream `deepseek-ai/deepseek-harness` — the FreeBSD patches are not merged there and would be missing.
+The result is `.work/tree`, the tree this runbook calls "the checkout". Run the
+remaining steps from there (or pass its path explicitly). The overlay README owns
+the full build and update workflow.
 
-> **A fresh clone needs no cleanup** — go straight to step 7. Only a checkout that is being **upgraded in place** needs the extra `pnpm run clean` step; see §7.1.
+> **A freshly built tree needs no cleanup** — go straight to step 7. Only a tree that
+> was **upgraded in place** needs the extra `pnpm run clean` step; see §7.1.
 
 ---
 
@@ -275,96 +279,27 @@ sh /tmp/dsh-jail-test.sh   # drops to caller uid, cwd=/workspace, ro denies writ
 
 ---
 
-### 8.2 Deploying on a second machine — notes for fb98 (192.168.0.88)
+### 8.2 Notes for a second machine
 
-The steps above were verified on `192.168.1.5` (FreeBSD 14.3, repo at `/home/workbuddy/github/deepseek-harness`). The same procedure was replicated on a second box **fb98 / 192.168.0.88 (FreeBSD 15.1-RELEASE-p1)**. The differences and two extra pitfalls specific to that machine are recorded here so a second deployment is reproducible.
+The overlay build is portable; these are the host facts that vary and the pitfalls
+seen on a second FreeBSD 15.x box.
 
-**Environment differences from 192.168.1.5**
-
-| Item | 192.168.1.5 | fb98 / 192.168.0.88 |
-| --- | --- | --- |
-| Repo path / user | `/home/workbuddy/github/deepseek-harness` (workbuddy) | `/home/skywalk/github/deepseek-harness` (skywalk) |
-| FreeBSD | 14.3-RELEASE amd64 | 15.1-RELEASE-p1 amd64 |
-| `/usr` mount | **read-only** → binary in `/var/dsh-jail-run` | **writable**, but install binary to `/var/dsh-jail-run` anyway to match the repo scripts' default `DSH_JAIL_RUN_BIN` |
-| `kern.racct.enable` | `1` | `0` — **not a blocker** (see note below) |
-| `nullfs` / `tmpfs` | nullfs loaded, tmpfs built-in | same (nullfs loaded at runtime; tmpfs built into GENERIC) |
-
-> ⚠️ **`/tmp` is a `nosuid` ZFS dataset on both boxes** — never install the setuid `dsh-jail-run` there, or the setuid bit is ignored and the helper silently fails. Use `/var/dsh-jail-run` (or `/usr/local/sbin/dsh-jail-run` on a writable-`/usr` host).
-
-**Step 0 — bring the repo up to the sandbox commit**
-
-On fb98 the repo was an *old* checkout with **no** FreeBSD jail sandbox code (`freebsd/dsh-jail-run.c`, `packages/sandbox/sandbox-local/`, `packages/sandbox/sandbox/` were all missing). Align it to `origin/master` first:
-
-```sh
-cd /home/skywalk/github/deepseek-harness
-git fetch origin
-git reset --hard origin/master     # now 9d1a0a6097, includes the jail sandbox + this runbook
-git log --oneline -1               # 9d1a0a6097 ...
-ls freebsd/dsh-jail-run.c packages/sandbox/sandbox-local/src   # must exist
-```
-
-**Pitfall A — `pnpm build:lib` (host) aborts on a broken test file**
-
-`pnpm run build` / `pnpm build:lib:host` runs `tsc -b` over every package **including** `packages/sandbox/sandbox-local/tests/**`. On `origin/master`, `packages/sandbox/sandbox-local/tests/boxrun.e2e.ts` still imports `boxrunProfileArgs` from `profiles.ts`, but that symbol was **removed** (TS2305). `tsc -b` aborts, so the `lib/` for `@deepseek-ai/dsh-sandbox-local` is **never produced** — and the stale `lib/` from an earlier boxrun-era build will wrongly select `/usr/local/sbin/boxrun` instead of `dsh-jail-run`.
-
-Symptom:
-
-```
-packages/sandbox/sandbox-local/tests/boxrun.e2e.ts:8:10
-  error TS2305: Module '.../profiles' has no exported member 'boxrunProfileArgs'.
-```
-
-Fix — temporarily move the offending test out, build, then restore it (the test file is not part of the `lib` output, so this changes no shipped code):
-
-```sh
-mv packages/sandbox/sandbox-local/tests/boxrun.e2e.ts /tmp/boxrun.e2e.ts.bak
-pnpm build:lib:host           # tsc -b + tsdown → lib/ produced
-# restore:
-mv /tmp/boxrun.e2e.ts.bak packages/sandbox/sandbox-local/tests/boxrun.e2e.ts
-```
-
-> If `git checkout -- <file>` reports "not known to git", the test file is untracked (e.g. gitignored) — restore it from `/tmp` instead, as shown. The repo working tree stays clean.
-
-Verify the rebuild actually selects the jail backend (not boxrun):
-
-```sh
-DSH_JAIL_RUN_BIN=/var/dsh-jail-run node freebsd/verify-sandbox.mjs
-# PASS=10 FAIL=0  (selected backend line shows dsh-jail-run, not boxrun)
-```
-
-> **`kern.racct.enable: 0` is fine.** `freebsd/dsh-jail-run.c` applies rctl resource limits with `rctl -a ... 2>/dev/null` (errors ignored), so the absence of RACCT/RCTL accounting does not block the jail — the backend still runs. Do not treat `kern.racct.enable: 0` as a failure.
-
-**Pitfall B — rc.d starts but the app hits `EACCES: /.dsh` (missing `$HOME`)**
-
-When started manually via `su skywalk -c '...'` the session inherits `HOME=/home/skywalk` and the web starts fine. But the **rc.d service** launches the command with an **empty `$HOME`** (defaults to `/`), so the harness tries to `mkdir /.dsh/profiles/node_modules` and dies with:
-
-```
-Error: EACCES: permission denied, mkdir '/.dsh/profiles/node_modules'
-```
-
-Fix — tell rc.d the home directory in `rc.conf`:
-
-```sh
-sysrc dsh_web_env="HOME=/home/skywalk"    # added alongside dsh_web_enable=YES etc.
-service dsh_web restart
-```
-
-Or skip the hand-editing entirely: `sh freebsd/install-service.sh` (§11.1) writes this variable — and the `dsh_web_user` that matches this checkout — for you.
-
-After this, `service dsh_web start` (the boot path) works and the running process shows `HOME=/home/skywalk`.
-
-> ⚠️ Any `service dsh_web ...` / `daemon` invocation that leaves a long-lived process will **swallow the SSH helper's command output** (the shell returns before the daemon detaches). Always verify the result with a **separate** status check (`pgrep -f dsh:freebsd`, `fetch -qo - http://127.0.0.1:3080`, count `SANDBOX_UNAVAILABLE` in the log) rather than trusting the start command's stdout.
-
-**Final verified state on fb98**
-
-| Check | Result |
+| Item | Why it matters |
 | --- | --- |
-| setuid helper `/var/dsh-jail-run` | `-rwsr-xr-x root:wheel`, `pwd` inside jail → `/workspace` |
-| `freebsd/verify-sandbox.mjs` | PASS=10 FAIL=0 |
-| `pnpm vitest run packages/sandbox/sandbox-local/tests/freebsd-jail.e2e.ts` | 5/5 |
-| web (`:3080`) | HTTP 200, `DSH_JAIL_RUN_BIN=/var/dsh-jail-run`, no `danger-full-access` (default jail-confined) |
-| `SANDBOX_UNAVAILABLE` in log | 0 |
-| rc.d boot autostart | `dsh_web_enable=YES` + `dsh_web_env="HOME=/home/skywalk"` |
+| `/tmp` is a `nosuid` dataset | Never install the setuid `dsh-jail-run` there: the kernel ignores the setuid bit and the helper silently cannot raise privileges. Use `/var/dsh-jail-run` (or `/usr/local/sbin/dsh-jail-run` when `/usr` is writable). |
+| `kern.racct.enable: 0` | Not a blocker. `dsh-jail-run` applies rctl limits with `rctl -a ... 2>/dev/null`; without RACCT the jail still runs, only the resource caps are absent. |
+| rc.d has an empty `$HOME` | `rc.subr` switches to `dsh_web_user` with `su -m`, so `HOME` must be set explicitly or the harness tries `mkdir /.dsh`. `install-service.sh` writes `dsh_web_env="HOME=..."` from the checkout owner; the rc.d script also defaults it to the service user's home. |
+| `/usr` read-only | Install the helper under `/var` and point `DSH_JAIL_RUN_BIN` there (`freebsd/dsh-web-run.sh` already defaults to `/var`). |
+
+Verify a deployment with the scripts rather than by reading a start command's
+stdout: `service`/`daemon` can detach and swallow the output, so check the live
+token, the listener and the sandbox backend with a separate command:
+
+```sh
+sh freebsd/dsh-web-restart.sh status
+DSH_JAIL_RUN_BIN=/var/dsh-jail-run sh freebsd/run-verify.sh   # PASS=10 FAIL=0
+sh freebsd/run-e2e.sh                                         # 5/5
+```
 
 ---
 
@@ -474,29 +409,20 @@ DSH_PROJECT_DIR=/home/skywalk/dswork sh freebsd/dsh-web-restart.sh restart   # w
 
 - `pnpm` must be persisted (on this box at `/home/<user>/.local/bin/pnpm` v11.28.5); do not rely on a `/tmp/p117`-style path that `/tmp` cleanup would wipe on reboot.
 - The rc.d `pidfile` and log live inside the repo (`dsh_web.pid`, `dsh_web.log`) so they survive reboots and `/tmp` cleanup.
-- The rc.d service runs as `dsh_web_user`. Its built-in default is `workbuddy`; on a checkout owned by anyone else, an unset `dsh_web_user` is why a hand-installed service refuses to come up. `install-service.sh` derives it for you.
+- The rc.d service runs as `dsh_web_user`. Its built-in default is `www`; on a checkout owned by anyone else, an unset `dsh_web_user` is why a hand-installed service refuses to come up. `install-service.sh` derives the checkout owner for you.
 
 ---
 
-## 12. Git: three remotes & lefthook bypass (only if you push patches back)
+## 12. Version control
 
-This repo has three remotes:
+The build tree is extracted with `git archive`, so it has no `.git`. The overlay
+records its source instead: `.work/tree/.dsh-freebsd-overlay` names the overlay
+revision and the upstream commit the tree was built from.
 
-```sh
-git remote -v
-# origin   https://gitcode.com/skywalk163/deepseek-harness (fetch/push)
-# github   git@github.com:skywalk163/deepseek-harness.git
-# gitea    http://192.168.1.5:3000/skywalk/deepseek-harness.git
-```
-
-On commit / push, **lefthook's `gen-third-party-notices` hook fails on FreeBSD because it needs `@anthropic-ai/claude-agent-sdk-linux-x64` (Linux-only build)** — unrelated to your change. Bypass:
-
-```sh
-git commit --no-verify
-git -c core.hooksPath=/tmp/nohooks push <remote> <branch>
-```
-
-(Inject the token into the URL when pushing to gitcode / gitea, per the repo's existing convention.)
+To carry a fix forward, change the overlay's patch series (see its README,
+"Updating to a new upstream release") rather than editing the build tree. The
+hosted CI workflows and the fork-only push/sync helpers are intentionally not part
+of the overlay.
 
 ---
 
@@ -514,18 +440,30 @@ git -c core.hooksPath=/tmp/nohooks push <remote> <branch>
 | `node-pty` build fails / ETIMEDOUT fetching Node headers | node-gyp cannot reach headers | Keep `disturl=https://registry.npmmirror.com/-/binary/node` in `.npmrc`; ensure the gmake shim is on `PATH`. |
 | `PTY shell exited during startup` / `terminal-bash: ... does not exist` | `bash` not installed (FreeBSD ships `/bin/sh`, not bash) | `pkg install bash`; the backend cannot use the default `/bin/sh`. |
 | `gen-third-party-notices` hook fails on commit/push | upstream hook needs Linux-only claude-agent-sdk | FreeBSD platform incompatibility, unrelated to your change. Bypass with `git commit --no-verify` or `git -c core.hooksPath=/tmp/nohooks push`. |
-| `grep` / `glob` fail with `could not start its search command (ripgrep launch failed)` | `@vscode/ripgrep` ships no FreeBSD native binary, so its `rgPath` points at a missing file | `pkg install ripgrep`, then the `grep`/`glob` tools auto-fall-back to the system `rg` (or set `DSH_RIPGREP_PATH` to your `rg`). Fixed in code at `packages/fs/tool-fs-search/src/search-core.ts`. |
+| `grep` / `glob` fail with `could not start its search command (ripgrep launch failed)` | `@vscode/ripgrep` ships no FreeBSD native binary, so its `rgPath` points at a missing file | `pkg install ripgrep`, then the `grep`/`glob` tools auto-fall-back to the system `rg` (or set `DSH_RIPGREP_PATH` to your `rg`). Fixed by overlay patch 0004 at `packages/util/ripgrep/src/index.ts`. |
 | `bash` / `grep` run in `$HOME` (or the repo root) instead of the project you set in the task | the web fork does not yet wire the task "项目目录" field into `session.header.cwd`; the command cwd falls back to `process.cwd()` (where `dsh web` was launched) | set the project explicitly: launch with `DSH_PROJECT_DIR=/path/to/project`, or in the rc.d service `sysrc dsh_web_projectdir="/path/to/project"`. The `freebsd/dsh-web-run.sh` launcher `cd`s into it. |
 | `tsc -b` fails with `error TS2305: ... has no exported member 'boxrunProfileArgs'` (host build) | stale `boxrun.e2e.ts` test references a removed symbol; `lib/` for `dsh-sandbox-local` is not produced, harness falls back to boxrun | temporarily `mv` the test out, run `pnpm build:lib:host`, restore it. See §8.2. |
 | `service dsh_web start` → `dsh_web: not found`, even though `dsh_web_enable="YES"` is in `rc.conf` | only the rc.conf flag was set — the rc.d script itself was never installed on this host (fresh machine, or one where the installer was never run) | install it: `sh freebsd/install-service.sh` writes `/usr/local/etc/rc.d/dsh_web` plus the remaining rc.conf variables and then starts/verifies. `--no-start` installs without touching the running service. |
-| service comes up but cannot write into the repo (`dsh_web.pid` / `dsh_web.log`), or `su` fails outright | `dsh_web_user` is not the owner of the checkout (the rc.d default is `workbuddy`) | `sh freebsd/install-service.sh --status` shows the mismatched pair; re-running the installer derives `dsh_web_user` from the checkout owner. |
+| service comes up but cannot write into the repo (`dsh_web.pid` / `dsh_web.log`), or `su` fails outright | `dsh_web_user` is not the owner of the checkout (the rc.d default is `www`) | `sh freebsd/install-service.sh --status` shows the mismatched pair; re-running the installer derives `dsh_web_user` from the checkout owner. |
 | `EACCES: permission denied, mkdir '/.dsh/...'` at web start (only via rc.d) | rc.d launches with empty `$HOME` (defaults to `/`) | `sysrc dsh_web_env="HOME=/home/skywalk"`; see §8.2. |
-| `flock is not supported on freebsd-x64` — the UI reports a failed turn (`本轮运行失败`) in **every** mode, minimal included | `@deepseek-ai/node-addon-system/flock` declared only Linux/macOS targets, and `native/system/scripts/build.ts` exited silently on FreeBSD, so no addon was ever built; every session write needs that lease | Fixed in this fork: a `freebsd-x64` platform package plus a FreeBSD branch in the build script. Run `git pull && pnpm install && pnpm run build:native-system`, then restart the service (`service dsh_web restart`). |
+| `flock is not supported on freebsd-x64` — the UI reports a failed turn (`本轮运行失败`) in **every** mode, minimal included | `@deepseek-ai/node-addon-system/flock` declared only Linux/macOS targets, and `native/system/scripts/build.ts` exited silently on FreeBSD, so no addon was ever built; every session write needs that lease | Fixed by overlay patch 0002: a `freebsd-x64` platform package plus a FreeBSD branch in the native build script. Run `git pull && pnpm install && pnpm run build:native-system`, then restart the service (`service dsh_web restart`). |
 | `build:lib:host` dies with `ERROR Error: [@deepseek-ai/dsh-root] Cannot find entry: ["lib/types/{index,startup}.js"]`, finally `build: build:lib exited with 1` | an **in-place** upgrade left manifest-less package "shells" (only the gitignored `node_modules/` + `lib/` survived the package removal); they still match the workspace glob `packages/*/*`, so `tsdown` resolves them to the nearest `package.json` — the repo root, `@deepseek-ai/dsh-root`. `git status` shows nothing because the leftovers are ignored | `for d in packages/*/*/; do [ -f "$d/package.json" ] || echo "STALE: $d"; done`, then `pnpm run clean` (or `mv` those directories out of the repo). **A fresh clone is immune** — this only bites upgrade-in-place. See §7.1. |
 
 ---
 
 ## 14. Verified on FreeBSD
+
+The overlay build was verified on **2026-11-24** at `dsh-v0.2.2-rc.5` on
+FreeBSD 15.1-RELEASE-p7 amd64 (16 cores / 16 GB, Node 22.23.5, pnpm 11.28.5).
+`sh scripts/build.sh --from-local …` applied all six patches to a pristine
+upstream tree, `pnpm install` reused 1428 store packages and compiled
+`node-pty` against the FreeBSD headers, and `pnpm run build` finished in
+**213 s** with **10/10 gates** and **371 client artifacts**. `scripts/verify.sh`
+then passed the CLI artifact (`0.2.2-rc.5`), the web bundle, the FreeBSD
+`flock` addon, a `-ljail` compile of the helper, the focused tests
+(`util/ripgrep` path fallback, `util/native-command`, sandbox local) and a
+loopback web boot on a scratch `DSH_HOME` that answered HTTP 200. Node 22 prints
+one `Unsupported engine` warning; Node 24 removes it.
 
 `node-pty` compiles natively, `sharp` renders through WASM, `pnpm run build` completes (`tsc -b` + `tsdown` + `vite`), and `dsh web` serves the UI over HTTP on loopback. The Node-API `flock` addon builds from source with the system `cc`, and the native suite it belongs to passes on FreeBSD — 52/52 (`node --test native/system/test/flock.test.js native/system/test/package-matrix.test.js`), including the independent C-oracle lock cross-checks and the session write lease (`SessionWriteLease`: acquire, mutual exclusion, hand-over after release).
 

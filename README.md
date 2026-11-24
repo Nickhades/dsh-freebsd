@@ -18,7 +18,7 @@ This overlay keeps only that delta:
 
 - **6 patches** against the pinned upstream commit (build config, native addon,
   jail sandbox, platform runtime, headless fixes, docs index).
-- **30 overlay files** the upstream tree does not have (the `freebsd/` operations
+- **39 overlay files** the upstream tree does not have (the `freebsd/` operations
   scripts, the setuid jail helper source, the FreeBSD runbooks, the port).
 
 Everything else — the agent, plugins, web UI, tests — comes from upstream
@@ -173,7 +173,11 @@ boot against a scratch `DSH_HOME` (token + HTTP 200). `--tests` adds the focused
 unit tests (`util/ripgrep`, `util/native-command`, sandbox local).
 
 The build recorded in this revision was run on **FreeBSD 15.1-RELEASE-p7 amd64**
-with Node 22.23.5 and pnpm 11.28.5.
+(16 cores / 16 GB, Node 22.23.5, pnpm 11.28.5): six patches applied to a pristine
+`dsh-v0.2.2-rc.5` tree, `pnpm install` reused 1428 store packages and compiled
+`node-pty` against the FreeBSD headers, `pnpm run build` finished in **213 s**
+with **10/10 gates** and **371 client artifacts**, and every verification check
+above passed.
 
 ## Troubleshooting
 

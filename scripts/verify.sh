@@ -24,6 +24,9 @@ while [ $# -gt 0 ]; do
 done
 TREE=${TREE:-$ROOT/.work/tree}
 [ -d "$TREE" ] || die "$TREE does not exist"
+TREE_ABS=$(CDPATH= cd -- "$TREE" && pwd)
+GIT_CEILING_DIRECTORIES="${TREE_ABS%/*}"
+export GIT_CEILING_DIRECTORIES
 
 failures=0
 pass() { printf '  [PASS] %s\n' "$*"; }
@@ -40,10 +43,11 @@ msg "verifying $TREE"
 
 if [ -s "$TREE/apps/cli/lib/bin.js" ]; then
   ver=$( cd "$TREE" && node --expose-internals apps/cli/lib/bin.js --version 2>&1 ) || ver=""
-  if [ "$ver" = "$(node -p "require('$TREE/package.json').version" 2>/dev/null)" ]; then
+  expected=$( cd "$TREE" && node -p "require('./package.json').version" 2>/dev/null ) || expected=""
+  if [ -n "$ver" ] && [ "$ver" = "$expected" ]; then
     pass "CLI reports version $ver"
   else
-    fail "CLI --version reported '$ver'"
+    fail "CLI --version reported '$ver' (expected '$expected')"
   fi
 fi
 
@@ -60,7 +64,9 @@ if [ -f "$TREE/freebsd/dsh-jail-run.c" ]; then
 fi
 
 if [ "$DO_TESTS" -eq 1 ]; then
-  if ( cd "$TREE" && pnpm exec vitest run packages/util/ripgrep packages/util/native-command packages/sandbox/sandbox-local/tests/local.spec.ts ) > "$TMP/tests.log" 2>&1; then
+  # The ripgrep stream tests exercise the packaged @vscode/ripgrep binary, which
+  # does not exist for FreeBSD; the fallback behavior is covered by path.spec.ts.
+  if ( cd "$TREE" && pnpm exec vitest run packages/util/ripgrep/tests/path.spec.ts packages/util/native-command packages/sandbox/sandbox-local/tests/local.spec.ts ) > "$TMP/tests.log" 2>&1; then
     pass "targeted unit tests"
   else
     tail -40 "$TMP/tests.log" >&2

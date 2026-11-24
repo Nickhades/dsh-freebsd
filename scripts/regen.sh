@@ -18,12 +18,14 @@ load_version "$ROOT/VERSION"
 TREE=${1:-}
 MODE=${2:-}
 [ -n "$TREE" ] || die "usage: sh scripts/regen.sh <git-tree> [--check]"
-[ -d "$TREE/.git" ] || die "$TREE is not a git repository"
+TREE_ABS=$(CDPATH= cd -- "$TREE" && pwd) || die "$TREE does not exist"
+top=$(git -C "$TREE" rev-parse --show-toplevel 2>/dev/null || true)
+[ "$top" = "$TREE_ABS" ] || die "$TREE must be the root of a git work tree (git worktree checkouts qualify)"
 check=0
 [ "$MODE" = "--check" ] && check=1
 
-if [ -n "$(git -C "$TREE" status --porcelain)" ]; then
-  die "$TREE has uncommitted changes; commit or discard them first"
+if ! git -C "$TREE" diff --quiet || ! git -C "$TREE" diff --cached --quiet; then
+  die "$TREE has uncommitted tracked changes; commit or discard them first"
 fi
 git -C "$TREE" merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD \
   || die "$UPSTREAM_COMMIT is not an ancestor of $TREE HEAD"

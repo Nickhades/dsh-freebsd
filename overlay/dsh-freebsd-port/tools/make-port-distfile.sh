@@ -73,7 +73,7 @@ command -v node >/dev/null 2>&1 || NODE_BIN=node24
 command -v "$NODE_BIN" >/dev/null 2>&1 || die "node not found on PATH"
 command -v curl >/dev/null 2>&1 || die "curl not found on PATH"
 
-[ -d "${REPO}/.git" ] || die "repo not found at ${REPO} (set DSH_REPO)"
+[ -f "${REPO}/package.json" ] || die "dsh tree not found at ${REPO} (set DSH_REPO)"
 # A previous run's stage is hardlinked from the pnpm store and inherits its
 # file flags (`ls -lo` shows `uarch`): rm then fails with EPERM ("Operation
 # not permitted") even for the owner, and a leftover stage makes the next
@@ -87,7 +87,7 @@ clean_stage() {
 clean_stage "${WORK}"
 mkdir -p "${WORK}"
 
-export PATH="/home/workbuddy/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:${PATH}"
+export PATH="${HOME}/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:${PATH}"
 
 log "preflight: build artifacts"
 for f in "${REPO}/apps/cli/lib/bin.js" \
@@ -207,18 +207,22 @@ log "fixups: dereference source-pointing symlinks (make the bundle portable)"
 # non-portable. Replace every such symlink with a real copy of its target.
 cd "${STAGE}" || die "cd ${STAGE} failed"
 find node_modules -type l 2>/dev/null | while read -r l; do
-  tgt=$(readlink "$l" 2>/dev/null || true)
-  case "$tgt" in
-    *github/deepseek-harness*)
-      real=$(readlink -f "$l" 2>/dev/null || true)
-      if [ -n "$real" ] && [ -e "$real" ]; then
-        rm -f "$l"
-        cp -R "$real" "$l"
-      fi
-      ;;
+  real=$(readlink -f "$l" 2>/dev/null || true)
+  [ -n "$real" ] || continue
+  if [ ! -e "$real" ]; then
+    # pnpm --legacy can leave a workspace dependency as a dangling file: link
+    # (observed for the macOS-only cua bundle). It never loads on FreeBSD and
+    # would leak an absolute build-host path into the distfile.
+    rm -f "$l"
+    continue
+  fi
+  case "$real" in
+    "${STAGE}"/*) continue ;;
   esac
+  rm -f "$l"
+  cp -R "$real" "$l"
 done
-echo "  source symlinks remaining: $(find node_modules -type l 2>/dev/null | xargs -I{} readlink {} 2>/dev/null | grep -c github/deepseek-harness)"
+echo "  external symlinks remaining: $(find node_modules -type l -exec readlink -f {} \; 2>/dev/null | grep -vc "^${STAGE}/" || true)"
 
 log "size: $(du -sh "${STAGE}" | cut -f1)"
 

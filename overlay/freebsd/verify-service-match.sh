@@ -40,7 +40,7 @@ else
         comm=$(ps -p "$p" -o comm= 2>/dev/null)
         args=$(ps -p "$p" -o args= 2>/dev/null)
         case "$comm:$args" in
-            node:"node /usr/local/bin/pnpm dsh:freebsd"*) ;;
+            node:*pnpm*dsh:freebsd*) ;;
             *) clean=0; bad "matched a non-service process $p ($comm: $args)" ;;
         esac
     done

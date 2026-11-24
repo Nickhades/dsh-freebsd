@@ -48,6 +48,13 @@ TREE=${TREE:-$WORK/tree}
 LOGS="$WORK/logs"
 mkdir -p "$WORK" "$LOGS"
 
+# The default tree lives inside this overlay's own git repository. Without a
+# ceiling, git-based child processes (pnpm's lefthook postinstall, tsc helpers)
+# would discover the outer repository and write hooks/config there.
+WORK_ABS=$(CDPATH= cd -- "$WORK" && pwd)
+GIT_CEILING_DIRECTORIES="$WORK_ABS"
+export GIT_CEILING_DIRECTORIES
+
 # node-gyp invokes `make`; FreeBSD's /usr/bin/make is BSD make, so put a GNU
 # make shim first on PATH instead of asking the operator to edit their shell.
 if ! make --version 2>/dev/null | grep -q 'GNU Make'; then

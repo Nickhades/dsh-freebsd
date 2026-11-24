@@ -38,9 +38,15 @@ fi
 # Check the whole series before mutating, so a moved upstream file is reported
 # without leaving a half-patched tree.
 if command -v git >/dev/null 2>&1; then
+  # The build tree usually sits inside this overlay's own git repository. A
+  # plain `git apply` there discovers the outer repository and silently skips
+  # every patch whose paths lack the caller's prefix, so pin discovery to the
+  # tree's parent: the tree is then either its own repository or no repository.
+  TREE_ABS=$(CDPATH= cd -- "$TREE" && pwd)
+  GIT_CEILING="${TREE_ABS%/*}"
   while IFS='	' read -r name paths; do
     case "$name" in ''|'#'*) continue ;; esac
-    ( cd "$TREE" && git apply --check --whitespace=nowarn "$ROOT/patches/$name" ) \
+    ( cd "$TREE" && GIT_CEILING_DIRECTORIES="$GIT_CEILING" git apply --check --whitespace=nowarn "$ROOT/patches/$name" ) \
       || die "$name does not apply to this tree: upstream likely moved the code. Rebase the overlay (see README, 'Updating to a new upstream release')."
   done < "$ROOT/patches/series"
 else
@@ -55,7 +61,7 @@ count=0
 while IFS='	' read -r name paths; do
   case "$name" in ''|'#'*) continue ;; esac
   if command -v git >/dev/null 2>&1; then
-    ( cd "$TREE" && git apply --whitespace=nowarn "$ROOT/patches/$name" ) \
+    ( cd "$TREE" && GIT_CEILING_DIRECTORIES="$GIT_CEILING" git apply --whitespace=nowarn "$ROOT/patches/$name" ) \
       || die "applying $name failed"
   else
     ( cd "$TREE" && patch -p1 -E -s < "$ROOT/patches/$name" ) \
