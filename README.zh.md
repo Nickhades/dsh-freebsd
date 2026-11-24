@@ -1,5 +1,7 @@
 # FreeBSD 上的 dsh —— 独立覆盖层
 
+[English](README.md) | 中文 | [完整中文手册](docs/zh/README.md)
+
 本目录存放 **DeepSeek Harness（`dsh`）** 的 FreeBSD 层，已与上游 monorepo 解耦：
 把它应用到一个干净的上游检出上，在 FreeBSD 15+ 上重新构建。
 

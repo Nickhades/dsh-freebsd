@@ -1,5 +1,7 @@
 # dsh on FreeBSD — standalone overlay
 
+English | [中文](README.zh.md) | [中文完整手册](docs/zh/README.md)
+
 This tree carries the FreeBSD layer for **DeepSeek Harness (`dsh`)**, decoupled
 from the upstream monorepo. It is applied to an untouched upstream checkout and
 built on FreeBSD 15+.
