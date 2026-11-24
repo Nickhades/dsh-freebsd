@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DeepSeek Harness
+GenericName=AI agent workspace
+Comment=Launch the DeepSeek Harness desktop window
+Exec=@EXEC@
+TryExec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Development;
+Keywords=dsh;deepseek;harness;agent;ai;
+StartupNotify=true
+StartupWMClass=DshDesktop

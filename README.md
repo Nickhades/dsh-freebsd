@@ -97,6 +97,55 @@ pnpm dsh:freebsd web
 no FreeBSD prebuild and no source fallback, so the internal ESM loader is the only
 route the HMR service has.
 
+## Desktop app (one-click)
+
+The overlay installs a real desktop app: a native **WebKitGTK** window that
+starts the harness on loopback, opens the UI, and stops the server when you close
+the window. Electron is not involved (it has no FreeBSD target); if WebKitGTK is
+unavailable the launcher falls back to a Chromium `--app` window.
+
+![DeepSeek Harness in the native WebKitGTK window](desktop/screenshot.png)
+
+```sh
+# runtime bundle (once per build)
+sh scripts/bundle.sh .work/tree-final 0.2.2-rc.5
+
+# install for the current user (~/.local); --prefix /usr/local as root
+sh desktop/install-desktop.sh
+
+# start it
+~/.local/bin/dsh-desktop        # or "DeepSeek Harness" in the application menu
+```
+
+Package it for another FreeBSD 15 machine:
+
+```sh
+sh scripts/package-desktop.sh
+# .work/desktop/dsh-desktop-0.2.2-rc.5-freebsd-amd64.tar.gz
+#   unpack, then: sh install-desktop.sh
+```
+
+Behavior:
+
+- One server per harness home. A second launch opens another window against the
+  running server instead of starting a second one.
+- Closing the last window stops the server, but only the launcher that started it
+  stops it.
+- State and logs: `${XDG_STATE_HOME:-~/.local/state}/dsh-desktop/`.
+- `DSH_DESKTOP_HOME` selects the harness home (default `~/.dsh`),
+  `DSH_DESKTOP_PORT` the preferred port (3080, or the first free one).
+- `~/.config/dsh-desktop/env` is sourced (and exported) before launch, so
+  deployment settings such as `DSH_PERMISSION_MODE` or `DSH_JAIL_RUN_BIN`
+  survive a menu launch. Without the setuid jail helper the confined modes fail
+  closed; `DSH_PERMISSION_MODE=danger-full-access` there is the documented
+  escape hatch, not the default.
+- Uninstall: `sh desktop/install-desktop.sh --uninstall`.
+
+Requirements: Node.js (node24) for the runtime, and either `webkit2gtk-4.1`
+(native window, compiled at install time) or Chromium. The window is built from
+the small C program in `desktop/dsh-desktop.c`; the installer also validates the
+`.desktop` entry and refreshes the menu and icon caches.
+
 ## What the patches carry
 
 | Patch | Contents |

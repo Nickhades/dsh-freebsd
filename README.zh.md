@@ -88,6 +88,50 @@ pnpm dsh:freebsd web
 FreeBSD 上 `--expose-internals` 是必须的：`node-addon-require-builtin` 没有
 freebsd-x64 预编译包也没有源码回退，HMR 服务只能走内部 ESM loader。
 
+## 桌面软件（一键启动）
+
+覆盖层可以安装真正的桌面应用：一个原生 **WebKitGTK** 窗口，自动在环回地址启动
+harness、打开 UI，关窗即停服务。不依赖 Electron（Electron 没有 FreeBSD 目标）；
+WebKitGTK 缺失时启动器回退到 Chromium `--app` 窗口。
+
+![原生 WebKitGTK 窗口里的 DeepSeek Harness](desktop/screenshot.png)
+
+```sh
+# 每次构建后先产出运行时包
+sh scripts/bundle.sh .work/tree-final 0.2.2-rc.5
+
+# 装给当前用户（~/.local）；root 可用 --prefix /usr/local
+sh desktop/install-desktop.sh
+
+# 启动
+~/.local/bin/dsh-desktop        # 或应用菜单里的 “DeepSeek Harness”
+```
+
+打包给另一台 FreeBSD 15 机器：
+
+```sh
+sh scripts/package-desktop.sh
+# .work/desktop/dsh-desktop-0.2.2-rc.5-freebsd-amd64.tar.gz
+#   解包后执行：sh install-desktop.sh
+```
+
+行为：
+
+- 同一个 harness home 只跑一个服务；第二次启动只是对已有服务再开一个窗口。
+- 关闭最后一个窗口会停掉服务，但只有启动服务的那次启动器会去停。
+- 状态与日志：`${XDG_STATE_HOME:-~/.local/state}/dsh-desktop/`。
+- `DSH_DESKTOP_HOME` 选 harness home（默认 `~/.dsh`），`DSH_DESKTOP_PORT`
+  选首选端口（3080，占用则自动换空闲端口）。
+- 启动前会 source（并导出）`~/.config/dsh-desktop/env`，因此
+  `DSH_PERMISSION_MODE`、`DSH_JAIL_RUN_BIN` 这类部署设置从菜单启动也生效。
+  没装 setuid jail 助手时受限模式会 fail-closed；在该文件里写
+  `DSH_PERMISSION_MODE=danger-full-access` 是文档化的逃生口，不是默认值。
+- 卸载：`sh desktop/install-desktop.sh --uninstall`。
+
+依赖：运行时需要 Node.js（node24）；原生窗口需要 `webkit2gtk-4.1`（安装时编译
+`desktop/dsh-desktop.c`），否则回退 Chromium。安装器还会校验 `.desktop` 菜单项
+并刷新菜单/图标缓存。
+
 ## 补丁内容
 
 | 补丁 | 内容 |

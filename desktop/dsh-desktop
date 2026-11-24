@@ -1,0 +1,264 @@
+#!/bin/sh
+# dsh-desktop - one-click desktop launcher for the DeepSeek Harness web UI.
+#
+# Starts the loopback harness on a free port, waits for the auth URL, opens it
+# in a native WebKitGTK window (installed next to this script), and stops the
+# server when the window closes. A second launch opens another window against
+# the running server instead of starting a second server.
+#
+# Environment:
+#   DSH_DESKTOP_HOME       harness home (default: $DSH_HOME or $HOME/.dsh)
+#   DSH_DESKTOP_PORT       preferred loopback port (default 3080; 0 = any free port)
+#   DSH_DESKTOP_NO_WINDOW  serve only, do not open a window (tests/diagnostics)
+#   DSH_DESKTOP_WINDOW     override the window binary
+#   DSH_DESKTOP_RUNTIME    override the runtime directory
+#   DSH_DESKTOP_LIBEXEC    override the libexec directory
+#   DSH_DESKTOP_STATE      override the state directory
+#   DSH_DESKTOP_NODE       node binary (default: node on PATH)
+#
+# Usage: dsh-desktop [--stop|--help]
+set -u
+
+# Desktop-menu launches get a minimal PATH; node and the window tools live in
+# /usr/local/bin on FreeBSD.
+PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:${PATH:-}"
+export PATH
+
+# Optional user environment, e.g. DSH_PERMISSION_MODE or DSH_JAIL_RUN_BIN.
+# `set -a` exports every assignment to the harness process.
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/dsh-desktop/env"
+if [ -f "$CONFIG_FILE" ]; then
+    set -a
+    . "$CONFIG_FILE"
+    set +a
+fi
+
+usage() {
+    sed -n '2,23p' "$0" | sed 's/^# {0,1}//'
+}
+
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+BIN_DIR=$(dirname "$SELF")
+PREFIX=$(dirname "$BIN_DIR")
+LIBEXEC=${DSH_DESKTOP_LIBEXEC:-$PREFIX/libexec/dsh-desktop}
+RUNTIME=${DSH_DESKTOP_RUNTIME:-$LIBEXEC/runtime}
+WINDOW=${DSH_DESKTOP_WINDOW:-$LIBEXEC/dsh-desktop-window}
+ICON=${DSH_DESKTOP_ICON:-$PREFIX/share/icons/hicolor/512x512/apps/dsh-desktop.png}
+STATE=${DSH_DESKTOP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dsh-desktop}
+HARNESS_HOME=${DSH_DESKTOP_HOME:-${DSH_HOME:-$HOME/.dsh}}
+SERVER_LOG="$STATE/server.log"
+WINDOW_LOG="$STATE/window.log"
+URLFILE="$STATE/url"
+PIDFILE="$STATE/server.pid"
+LAUNCHER_PIDFILE="$STATE/launcher.pid"
+LOCK="$STATE/lock"
+OWN_LOCK=0
+OWN_SERVER=0
+SERVER_PID=""
+WINDOW_PID=""
+
+mkdir -p "$STATE" || { echo "dsh-desktop: cannot create $STATE" >&2; exit 1; }
+
+notify_error() {
+    printf 'dsh-desktop: %s\n' "$1" >&2
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="DeepSeek Harness" --no-wrap --text="$1" >/dev/null 2>&1 &
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "DeepSeek Harness" "$1" >/dev/null 2>&1 || true
+    fi
+}
+
+fail() {
+    notify_error "$1"
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$WINDOW_PID" ] && kill -0 "$WINDOW_PID" 2>/dev/null; then
+        kill "$WINDOW_PID" 2>/dev/null || true
+        wait "$WINDOW_PID" 2>/dev/null || true
+    fi
+    if [ "$OWN_SERVER" = 1 ] && [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ "$OWN_LOCK" = 1 ]; then
+        rm -f "$PIDFILE" "$URLFILE" "$LAUNCHER_PIDFILE"
+        rmdir "$LOCK" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "${1:-}" in
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    --stop)
+        # Ask the owning launcher to exit; its cleanup closes the window and
+        # stops the server. Fall back to the recorded server pid.
+        launcher=$(cat "$LAUNCHER_PIDFILE" 2>/dev/null || true)
+        pid=$(cat "$PIDFILE" 2>/dev/null || true)
+        if [ -n "$launcher" ] && kill -0 "$launcher" 2>/dev/null; then
+            kill "$launcher" 2>/dev/null || true
+            i=0
+            while [ "$i" -lt 10 ] && kill -0 "$launcher" 2>/dev/null; do
+                sleep 1
+                i=$((i + 1))
+            done
+        elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE" "$URLFILE" "$LAUNCHER_PIDFILE"
+        rmdir "$LOCK" 2>/dev/null || true
+        echo "dsh-desktop: stopped"
+        exit 0
+        ;;
+    "") ;;
+    *)
+        fail "unknown option: $1"
+        ;;
+esac
+
+find_node() {
+    if [ -n "${DSH_DESKTOP_NODE:-}" ]; then
+        printf '%s' "$DSH_DESKTOP_NODE"
+        return 0
+    fi
+    for candidate in node node24; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_runtime_entry() {
+    for candidate in "$RUNTIME/lib/bin.js" "$RUNTIME/apps/cli/lib/bin.js"; do
+        if [ -f "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+port_free() {
+    "$NODE" -e 'const net=require("node:net");const s=net.createServer();s.once("error",()=>process.exit(1));s.listen(Number(process.argv[1]),"127.0.0.1",()=>s.close(()=>process.exit(0)))' "$1" >/dev/null 2>&1
+}
+
+extract_url() {
+    grep -oE 'http://127\.0\.0\.1:[0-9]+/\?token=[A-Za-z0-9_-]+' "$SERVER_LOG" 2>/dev/null | tail -1
+}
+
+run_window() {
+    url=$1
+    if [ -n "${DSH_DESKTOP_NO_WINDOW:-}" ]; then
+        if [ -n "$SERVER_PID" ]; then
+            wait "$SERVER_PID" 2>/dev/null || true
+        fi
+        return 0
+    fi
+    printf '\n== %s\n' "$(date)" >> "$WINDOW_LOG"
+    if [ -x "$WINDOW" ]; then
+        # Extra flags for diagnostics, intentionally word-split.
+        # shellcheck disable=SC2086
+        "$WINDOW" --url "$url" --title "DeepSeek Harness" --icon "$ICON" ${DSH_DESKTOP_WINDOW_ARGS:-} >> "$WINDOW_LOG" 2>&1 &
+        WINDOW_PID=$!
+        wait "$WINDOW_PID"
+        return $?
+    fi
+    browser=${DSH_DESKTOP_BROWSER:-}
+    if [ -z "$browser" ]; then
+        for candidate in chrome chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                browser=$(command -v "$candidate")
+                break
+            fi
+        done
+    fi
+    if [ -n "$browser" ]; then
+        # Chromium/Chrome app mode: a chromeless window with its own WM class.
+        "$browser" --app="$url" --class=DshDesktop \
+            --user-data-dir="$STATE/browser-profile" \
+            --no-first-run --no-default-browser-check --disable-features=TranslateUI \
+            >> "$WINDOW_LOG" 2>&1 &
+        WINDOW_PID=$!
+        wait "$WINDOW_PID"
+        return $?
+    fi
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 || fail "cannot open the Web UI"
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --info --title="DeepSeek Harness" \
+                --text="The Web UI opened in your browser. Close this dialog to stop the local server." \
+                >/dev/null 2>&1 || true
+        else
+            notify_error "The Web UI opened in your default browser; the local server keeps running until this launcher is stopped."
+            wait "$SERVER_PID" 2>/dev/null || true
+        fi
+        return 0
+    fi
+    fail "no window backend: install webkit2gtk-4.1 or a Chromium browser"
+}
+
+NODE=$(find_node) || fail "Node.js not found; install www/node24"
+ENTRY=$(find_runtime_entry) || fail "runtime not found at $RUNTIME; reinstall the desktop app"
+[ -d "$HARNESS_HOME" ] || mkdir -p "$HARNESS_HOME" || fail "cannot create $HARNESS_HOME"
+
+# Reuse a running instance instead of starting a second server on the same home.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    # Give a launcher that already owns the lock time to print its URL.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        [ -s "$URLFILE" ] && break
+        other_launcher=$(cat "$LAUNCHER_PIDFILE" 2>/dev/null || true)
+        [ -n "$other_launcher" ] && kill -0 "$other_launcher" 2>/dev/null || break
+        sleep 1
+    done
+    other=$(cat "$PIDFILE" 2>/dev/null || true)
+    existing=$(cat "$URLFILE" 2>/dev/null || true)
+    if [ -n "$other" ] && kill -0 "$other" 2>/dev/null && [ -n "$existing" ]; then
+        run_window "$existing"
+        exit $?
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || fail "cannot lock $LOCK"
+fi
+OWN_LOCK=1
+printf '%s\n' "$$" > "$LAUNCHER_PIDFILE"
+
+PORT=${DSH_DESKTOP_PORT:-3080}
+if ! port_free "$PORT"; then
+    PORT=0
+fi
+
+: > "$SERVER_LOG"
+(
+    cd "$RUNTIME" || exit 1
+    HOME="$HOME" DSH_HOME="$HARNESS_HOME" "$NODE" --expose-internals "$ENTRY" \
+        web --host 127.0.0.1 --port "$PORT" --no-open
+) >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+OWN_SERVER=1
+
+URL=""
+i=0
+while [ "$i" -lt 120 ]; do
+    URL=$(extract_url)
+    [ -n "$URL" ] && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        fail "the harness exited during startup; see $SERVER_LOG"
+    fi
+    sleep 1
+    i=$((i + 1))
+done
+[ -n "$URL" ] || fail "the harness did not print an auth URL within 120s; see $SERVER_LOG"
+
+printf '%s\n' "$SERVER_PID" > "$PIDFILE"
+printf '%s\n' "$URL" > "$URLFILE"
+
+run_window "$URL"
+exit $?
